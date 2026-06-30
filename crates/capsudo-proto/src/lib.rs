@@ -8,20 +8,23 @@
 //!
 //! # Framing
 //!
-//! Every message is a fixed 5-byte header followed by a variable payload:
+//! Every message is a fixed 8-byte header followed by a variable payload:
 //!
 //! ```text
-//! +-----------+------------------+-----------------------+
-//! | u8        | u32 little-endian| payload (`len` bytes) |
-//! | field_type|       len        |                       |
-//! +-----------+------------------+-----------------------+
+//! +-------------------+-------------------+-----------------------+
+//! | u32 little-endian | u32 little-endian | payload (`len` bytes) |
+//! |    field_type     |       len         |                       |
+//! +-------------------+-------------------+-----------------------+
 //! ```
 //!
-//! The framing is explicitly little-endian and fixed-width so that it survives a
-//! hop across a zone boundary unchanged — unlike the C implementation, which
-//! writes raw native structs and therefore silently assumes both peers share an
-//! ABI. A capsudo proxy bridging an `AF_UNIX` endpoint in one zone to an IDM
-//! endpoint in another can forward these frames verbatim.
+//! The framing is explicitly little-endian and fixed-width — no native integer
+//! widths, no struct padding — so it is identical on every host and survives a
+//! hop across a zone boundary unchanged. The C implementation speaks this exact
+//! same format, so the two are byte-compatible: a Rust client can talk to a C
+//! daemon, and a proxy can forward frames between an `AF_UNIX` endpoint and an
+//! IDM endpoint verbatim. Payloads are likewise host-stable: integers are
+//! little-endian fixed-width (`u32`/`u16`), strings are UTF-8 with no trailing
+//! NUL.
 //!
 //! # File descriptors
 //!
@@ -39,9 +42,10 @@ pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// Type tag identifying the meaning of a [`Message`] payload.
 ///
-/// The discriminants are stable wire values and must never be reused.
+/// The discriminants are stable wire values (serialized as `u32` little-endian)
+/// and must never be reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum FieldType {
     /// One element of the target program's argument vector (UTF-8, NUL-free).
     Arg = 1,
@@ -70,16 +74,16 @@ pub enum FieldType {
 }
 
 impl FieldType {
-    /// Returns the wire byte for this field type.
-    pub const fn as_u8(self) -> u8 {
-        self as u8
+    /// Returns the wire value for this field type.
+    pub const fn as_u32(self) -> u32 {
+        self as u32
     }
 }
 
-impl TryFrom<u8> for FieldType {
+impl TryFrom<u32> for FieldType {
     type Error = ProtoError;
 
-    fn try_from(value: u8) -> Result<Self, ProtoError> {
+    fn try_from(value: u32) -> Result<Self, ProtoError> {
         Ok(match value {
             1 => FieldType::Arg,
             2 => FieldType::Env,
@@ -158,13 +162,13 @@ pub struct Header {
 
 impl Header {
     /// Encoded size of a header in bytes.
-    pub const SIZE: usize = 5;
+    pub const SIZE: usize = 8;
 
-    /// Serializes the header into its 5-byte wire form.
+    /// Serializes the header into its 8-byte wire form.
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0] = self.field_type.as_u8();
-        buf[1..5].copy_from_slice(&self.len.to_le_bytes());
+        buf[0..4].copy_from_slice(&self.field_type.as_u32().to_le_bytes());
+        buf[4..8].copy_from_slice(&self.len.to_le_bytes());
         buf
     }
 
@@ -173,8 +177,8 @@ impl Header {
     /// Enforces [`MAX_PAYLOAD`] so a hostile or corrupt peer cannot induce a
     /// huge allocation.
     pub fn decode(buf: &[u8; Self::SIZE]) -> Result<Header, ProtoError> {
-        let field_type = FieldType::try_from(buf[0])?;
-        let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        let field_type = FieldType::try_from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))?;
+        let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         if len as usize > MAX_PAYLOAD {
             return Err(ProtoError::PayloadTooLarge(len));
         }
@@ -254,7 +258,10 @@ impl Message {
 
     /// An [`FieldType::SessionType`].
     pub fn session_type(ty: SessionType) -> Message {
-        Message::new(FieldType::SessionType, vec![ty.as_u8()])
+        Message::new(
+            FieldType::SessionType,
+            (ty.as_u8() as u32).to_le_bytes().to_vec(),
+        )
     }
 
     /// An [`FieldType::Error`] carrying a human-readable message.
@@ -334,15 +341,14 @@ impl Message {
         Ok(dims)
     }
 
-    /// Interprets the payload as a [`SessionType`].
+    /// Interprets the payload as a [`SessionType`] (`u32` little-endian).
     pub fn as_session_type(&self) -> Result<SessionType, ProtoError> {
-        match self.payload.as_slice() {
-            [byte] => SessionType::try_from(*byte),
-            _ => Err(ProtoError::InvalidPayload {
-                field_type: self.field_type,
-                reason: "expected single session-type byte",
-            }),
-        }
+        let value = self.as_u32()?;
+        let byte = u8::try_from(value).map_err(|_| ProtoError::InvalidPayload {
+            field_type: self.field_type,
+            reason: "session type out of range",
+        })?;
+        SessionType::try_from(byte)
     }
 }
 
@@ -358,9 +364,9 @@ impl fmt::Debug for Message {
 /// Errors arising from protocol encoding/decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
-    /// A header named a field-type byte that is not defined.
-    #[error("unknown field type byte: {0}")]
-    UnknownFieldType(u8),
+    /// A header named a field-type value that is not defined.
+    #[error("unknown field type: {0}")]
+    UnknownFieldType(u32),
 
     /// A session-type payload held an undefined value.
     #[error("invalid session type byte: {0}")]
@@ -398,7 +404,7 @@ mod tests {
             FieldType::Winsize,
             FieldType::End,
         ] {
-            assert_eq!(FieldType::try_from(ft.as_u8()).unwrap(), ft);
+            assert_eq!(FieldType::try_from(ft.as_u32()).unwrap(), ft);
         }
     }
 
@@ -417,8 +423,9 @@ mod tests {
             len: 0x0001_0203,
         };
         let bytes = hdr.encode();
-        // Explicit little-endian layout, independent of host byte order.
-        assert_eq!(bytes, [1, 0x03, 0x02, 0x01, 0x00]);
+        // Explicit little-endian layout, independent of host byte order:
+        // u32le field type (1) then u32le length (0x00010203).
+        assert_eq!(bytes, [1, 0, 0, 0, 0x03, 0x02, 0x01, 0x00]);
         assert_eq!(Header::decode(&bytes).unwrap(), hdr);
     }
 
@@ -429,7 +436,7 @@ mod tests {
             len: 0,
         }
         .encode();
-        bytes[1..5].copy_from_slice(&((MAX_PAYLOAD as u32) + 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&((MAX_PAYLOAD as u32) + 1).to_le_bytes());
         assert!(matches!(
             Header::decode(&bytes),
             Err(ProtoError::PayloadTooLarge(_))
@@ -440,9 +447,9 @@ mod tests {
     fn message_encode_prefixes_header() {
         let msg = Message::arg("ls");
         let encoded = msg.encode();
-        assert_eq!(encoded[0], FieldType::Arg.as_u8());
-        assert_eq!(&encoded[1..5], &2u32.to_le_bytes());
-        assert_eq!(&encoded[5..], b"ls");
+        assert_eq!(&encoded[0..4], &FieldType::Arg.as_u32().to_le_bytes());
+        assert_eq!(&encoded[4..8], &2u32.to_le_bytes());
+        assert_eq!(&encoded[8..], b"ls");
     }
 
     #[test]
