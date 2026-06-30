@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capsudo-proto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "0BSD"
+authors = ["Ariadne Conill <ariadne@ariadne.space>"]
+repository = "https://github.com/ariadneconill/capsudo-rs"
+
+[workspace.dependencies]
+thiserror = "2"
