@@ -15,32 +15,63 @@ started ahead of time, already holding the privilege you want to delegate, and
 bound to a *transport endpoint*. Whoever can reach that endpoint can invoke the
 capability. The endpoint **is** the capability.
 
-In the original, the endpoint is always a `AF_UNIX` socket whose file
+In the original, the endpoint is always an `AF_UNIX` socket whose file
 permissions decide who may connect. Here the transport is abstracted: the same
 protocol and the same client/daemon logic run unchanged over a local Unix
-socket *or* over a cross-zone IDM channel, so a capability held in one Edera
-zone can be exposed to another without either side knowing the difference.
+socket *or* a cross-zone IDM channel, so a capability held in one Edera zone can
+be exposed to another without either side knowing the difference.
 
 ## Why a rewrite was needed for cross-zone
 
-The original delegates the caller's terminal by passing stdin/stdout/stderr as
-file descriptors over `SCM_RIGHTS`. File descriptors are meaningless across a
-zone boundary. The transport layer here papers over that: on a local socket it
-uses real `SCM_RIGHTS`, and on a non-local channel it **simulates** descriptor
-passing by multiplexing the stream data and handing each side local pipe ends.
-Client and daemon code never learn which happened.
+Two things in the original assume a shared kernel:
+
+1. **Descriptor passing.** The caller's stdin/stdout/stderr are handed to the
+   daemon over `SCM_RIGHTS`. File descriptors are meaningless across a zone
+   boundary. Here the transport layer papers over that — real `SCM_RIGHTS`
+   locally, **simulated** descriptor passing (stream multiplexing + local pipe
+   ends) cross-zone — transparently, so client and daemon never learn which
+   happened.
+
+2. **The interactive pty.** The original allocates the pty on the *client* and
+   ships the slave. A pty slave is a real terminal; a socket pair (all a
+   cross-zone link can fabricate) is not. So the pty is allocated on the
+   **daemon** side instead: the child always gets a genuine controlling
+   terminal in its own zone, and only a byte stream plus window-size updates
+   cross the channel. (The C version was updated to match.)
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `capsudo-proto` | Transport-agnostic wire protocol: message types and portable, fixed-endianness framing. No I/O. |
+| `capsudo-proto` | Transport-agnostic wire protocol: message types, portable fixed-endianness framing. No I/O. |
+| `capsudo-transport` | `Transport`/`Listener` traits + implementations: `unix` (real `SCM_RIGHTS`), `mux` (simulated fd-passing over any byte channel), `idm` (cross-zone stub, feature `idm`). |
+| `capsudo-core` | Client and daemon session logic, written entirely against the traits. |
+| `capsudo` | Client binary. |
+| `capsudod` | Daemon binary (listening, or one-shot on stdin). |
+| `capsudod-pwauth` | Authenticating front-end: shadow-password check, then chain to `capsudod`. |
 
-(More crates land as the implementation grows; see `CLAUDE.md`.)
-
-## Build
+## Build & test
 
 ```
 cargo build
 cargo test
+cargo build --features capsudo-transport/idm    # include the IDM stub
 ```
+
+## Command-line
+
+```
+# Delegate "run anything" to whoever can reach the socket:
+capsudod -S /run/capsudo/sudo -o root:wheel -m 0770 &
+capsudo  -S /run/capsudo/sudo -- id
+
+# Pin an exact command (client args ignored):
+capsudod -S /run/capsudo/reboot -f /sbin/reboot &
+capsudo  -S /run/capsudo/reboot
+
+# Require a password first, then chain to capsudod:
+capsudod-pwauth -S /run/capsudo/auth -o root:wheel -m 0770 -- capsudod &
+capsudo -S /run/capsudo/auth -- id
+```
+
+See `CLAUDE.md` for the architecture in depth.

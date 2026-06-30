@@ -41,12 +41,32 @@ struct SessionRequest {
     session_type: SessionType,
     stdio: [OwnedFd; 3],
     winsize: [u16; 4],
+    /// SELinux context of the connecting peer, to run the child under.
+    secontext: Option<Vec<u8>>,
+}
+
+/// Applies an SELinux exec context in the just-forked child via
+/// `/proc/self/attr/exec`. Uses only async-signal-safe syscalls.
+pub(crate) fn write_secontext_in_child(context: &[u8]) -> std::io::Result<()> {
+    let fd = unsafe { libc::open(c"/proc/self/attr/exec".as_ptr(), libc::O_WRONLY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let written =
+        unsafe { libc::write(fd, context.as_ptr() as *const libc::c_void, context.len()) };
+    unsafe {
+        libc::close(fd);
+    }
+    if written < 0 || written as usize != context.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Serves a single client connection: receives configuration, runs the
 /// program, and reports the exit status.
 pub async fn serve_connection(transport: &mut dyn Transport, config: &DaemonConfig) -> Result<()> {
-    let request = match receive_configuration(transport, config).await {
+    let mut request = match receive_configuration(transport, config).await {
         Ok(request) => request,
         Err(e) => {
             let _ = send_error(transport, &e.to_string()).await;
@@ -54,6 +74,10 @@ pub async fn serve_connection(transport: &mut dyn Transport, config: &DaemonConf
             return Err(e);
         }
     };
+
+    // The peer's SELinux context (where the transport can supply it) is applied
+    // to the child so it runs as the caller, not the daemon.
+    request.secontext = transport.peer_secontext();
 
     run_and_report(transport, request).await
 }
@@ -116,6 +140,7 @@ async fn receive_configuration(
         session_type,
         stdio,
         winsize,
+        secontext: None,
     })
 }
 
@@ -129,6 +154,7 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
             request.envp,
             request.stdio,
             request.winsize,
+            request.secontext,
         )
         .await;
     }
@@ -150,6 +176,12 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
     command.stdin(Stdio::from(child_stdin));
     command.stdout(Stdio::from(child_stdout));
     command.stderr(Stdio::from(child_stderr));
+
+    if let Some(context) = request.secontext {
+        unsafe {
+            command.pre_exec(move || write_secontext_in_child(&context));
+        }
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,

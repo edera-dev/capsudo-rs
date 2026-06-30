@@ -45,6 +45,7 @@ pub(crate) async fn run_interactive(
     envp: Vec<String>,
     client_fds: [OwnedFd; 3],
     winsize: [u16; 4],
+    secontext: Option<Vec<u8>>,
 ) -> Result<()> {
     let ws = to_winsize(winsize);
     let pty = openpty(Some(&ws), None).map_err(io::Error::from)?;
@@ -66,12 +67,15 @@ pub(crate) async fn run_interactive(
     command.stdout(Stdio::from(slave.try_clone().map_err(CoreError::Io)?));
     command.stderr(Stdio::from(slave));
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if let Some(context) = &secontext {
+                crate::daemon::write_secontext_in_child(context)?;
             }
             Ok(())
         });

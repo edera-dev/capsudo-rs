@@ -180,6 +180,32 @@ impl Transport for UnixTransport {
         })
     }
 
+    fn peer_secontext(&self) -> Option<Vec<u8>> {
+        let fd = self.stream.as_raw_fd();
+        let mut buf = vec![0u8; 4096];
+        let mut len = buf.len() as libc::socklen_t;
+
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERSEC,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+
+        buf.truncate(len as usize);
+        // The context is NUL-terminated; drop it.
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        (!buf.is_empty()).then_some(buf)
+    }
+
     fn control_sender(&self) -> Option<Box<dyn ControlSender>> {
         // A dup writes to the same socket independently of the receiving path.
         // Safe here because the only post-handshake writes are winsize updates;
