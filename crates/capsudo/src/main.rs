@@ -4,7 +4,7 @@
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::process::ExitCode;
 
-use capsudo_core::{run_client, ClientRequest};
+use capsudo_core::{run_session, ClientRequest, SessionOutcome};
 use capsudo_proto::SessionType;
 use capsudo_transport::UnixTransport;
 
@@ -152,14 +152,6 @@ async fn main() -> ExitCode {
         winsize: request_winsize,
     };
 
-    let mut transport = match UnixTransport::connect(&opts.socket).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("capsudo: cannot connect to daemon at {}: {e}", opts.socket);
-            return ExitCode::FAILURE;
-        }
-    };
-
     // Delegate our own standard streams; for an interactive session these are
     // our terminal, which the daemon bridges to the pty it allocates.
     let stdin = std::io::stdin();
@@ -167,11 +159,76 @@ async fn main() -> ExitCode {
     let stderr = std::io::stderr();
     let stdio = [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
 
-    match run_client(&mut transport, &request, stdio).await {
-        Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(0)),
-        Err(e) => {
-            eprintln!("capsudo: {e}");
-            ExitCode::FAILURE
+    // Reconnect-and-retry once if an authenticating front-end demands a secret.
+    let mut secret: Option<String> = None;
+    loop {
+        let mut transport = match UnixTransport::connect(&opts.socket).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("capsudo: cannot connect to daemon at {}: {e}", opts.socket);
+                return ExitCode::FAILURE;
+            }
+        };
+
+        match run_session(&mut transport, &request, stdio, secret.as_deref()).await {
+            Ok(SessionOutcome::Exited(code)) => {
+                return ExitCode::from(u8::try_from(code & 0xff).unwrap_or(0));
+            }
+            Ok(SessionOutcome::Unauthorized(prompt)) => {
+                if secret.is_some() {
+                    eprintln!("capsudo: authentication failed");
+                    return ExitCode::FAILURE;
+                }
+                match prompt_secret(&prompt) {
+                    Some(s) => secret = Some(s),
+                    None => {
+                        eprintln!("capsudo: a secret is required but none was provided");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("capsudo: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+/// Prompts for a secret on the controlling terminal with echo disabled.
+fn prompt_secret(prompt: &str) -> Option<String> {
+    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+    use std::io::{BufRead, BufReader, Write};
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let fd = tty.as_fd();
+
+    // Disable echo (and ensure canonical line input) for the prompt, restoring
+    // the prior terminal state afterward.
+    let original = tcgetattr(fd).ok()?;
+    let mut quiet = original.clone();
+    quiet.local_flags.remove(LocalFlags::ECHO);
+    quiet.local_flags.insert(LocalFlags::ICANON);
+    let _ = tcsetattr(fd, SetArg::TCSANOW, &quiet);
+
+    let _ = write!(&tty, "{prompt}");
+    let _ = (&tty).flush();
+
+    let mut line = String::new();
+    let read = BufReader::new(&tty).read_line(&mut line);
+
+    let _ = tcsetattr(fd, SetArg::TCSANOW, &original);
+    let _ = writeln!(&tty);
+
+    match read {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let secret = line.trim_end_matches(['\r', '\n']).to_owned();
+            (!secret.is_empty()).then_some(secret)
         }
     }
 }

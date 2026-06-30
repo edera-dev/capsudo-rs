@@ -6,6 +6,7 @@ members = [
     "crates/capsudo-core",
     "crates/capsudo",
     "crates/capsudod",
+    "crates/capsudod-pwauth",
 ]
 
 [workspace.package]

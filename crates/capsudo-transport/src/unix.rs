@@ -43,6 +43,20 @@ impl UnixTransport {
         Ok(UnixTransport::new(stream))
     }
 
+    /// Wraps an inherited connected socket descriptor (e.g. capsudod's stdin
+    /// when chained behind an authenticating front-end).
+    pub fn from_fd(fd: OwnedFd) -> Result<UnixTransport> {
+        let std_stream = std::os::unix::net::UnixStream::from(fd);
+        std_stream.set_nonblocking(true)?;
+        Ok(UnixTransport::new(UnixStream::from_std(std_stream)?))
+    }
+
+    /// Reclaims the underlying stream — used to hand the live socket to another
+    /// process after reading just the first message from it.
+    pub fn into_inner(self) -> UnixStream {
+        self.stream
+    }
+
     /// Reads one message header, capturing any `SCM_RIGHTS` descriptors that
     /// arrive with it. Returns `Ok(None)` on a clean EOF at a frame boundary.
     async fn recv_header(&mut self) -> Result<Option<(Header, Vec<OwnedFd>)>> {

@@ -83,6 +83,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "capsudod-pwauth"
+version = "0.1.0"
+dependencies = [
+ "capsudo-proto",
+ "capsudo-transport",
+ "libc",
+ "nix",
+ "tokio",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

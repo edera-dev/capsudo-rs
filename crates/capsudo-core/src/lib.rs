@@ -11,6 +11,6 @@ mod error;
 mod exit;
 mod pty;
 
-pub use client::{read_winsize, run_client, ClientRequest};
+pub use client::{read_winsize, run_client, run_session, ClientRequest, SessionOutcome};
 pub use daemon::{serve_connection, DaemonConfig};
 pub use error::{CoreError, Result};

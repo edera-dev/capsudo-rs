@@ -3,9 +3,11 @@
 
 use std::process::ExitCode;
 
+use std::os::fd::{FromRawFd, OwnedFd};
+
 use capsudo_core::{serve_connection, DaemonConfig};
 use capsudo_transport::ownerspec::{parse_mode, parse_owner_spec};
-use capsudo_transport::{Listener, UnixListener};
+use capsudo_transport::{Listener, UnixListener, UnixTransport};
 
 struct Options {
     socket: Option<String>,
@@ -95,10 +97,24 @@ async fn main() -> ExitCode {
     };
 
     let Some(socket) = opts.socket else {
-        // One-shot mode over stdin (used when chained behind an authenticating
-        // front-end) arrives in a later step.
-        eprintln!("capsudod: a listening socket (-S) is required");
-        return ExitCode::FAILURE;
+        // One-shot mode: serve a single connection on inherited stdin. This is
+        // how an authenticating front-end (capsudod-pwauth) chains to us — it
+        // hands over the already-authenticated client socket as our stdin.
+        let fd = unsafe { OwnedFd::from_raw_fd(0) };
+        let mut transport = match UnixTransport::from_fd(fd) {
+            Ok(transport) => transport,
+            Err(e) => {
+                eprintln!("capsudod: stdin is not a usable socket: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match serve_connection(&mut transport, &config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("capsudod: session error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     };
 
     let mut listener = match UnixListener::bind(&socket, opts.uid, opts.gid, opts.mode) {

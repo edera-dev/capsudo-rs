@@ -33,45 +33,85 @@ pub struct ClientRequest {
     pub winsize: Option<[u16; 4]>,
 }
 
+/// How a client session ended.
+pub enum SessionOutcome {
+    /// The program ran and exited with this status.
+    Exited(i32),
+    /// The daemon (or an authenticating front-end) requires a secret; the
+    /// payload is the prompt to show the user. The caller should obtain a
+    /// secret, reconnect, and retry with it.
+    Unauthorized(String),
+}
+
 /// Runs a client session to completion and returns the target program's exit
-/// status.
-///
-/// `stdio` holds the three descriptors (stdin, stdout, stderr) to delegate. For
-/// a non-interactive session these are the client's own standard streams; for
-/// an interactive session they are the client's terminal, which the daemon
-/// bridges to the pty it allocates.
+/// status. Treats an authentication challenge as an error; use [`run_session`]
+/// to drive the secret-retry flow.
 pub async fn run_client(
     transport: &mut dyn Transport,
     request: &ClientRequest,
     stdio: [BorrowedFd<'_>; 3],
 ) -> Result<i32> {
-    send_configuration(transport, request, stdio).await?;
+    match run_session(transport, request, stdio, None).await? {
+        SessionOutcome::Exited(code) => Ok(code),
+        SessionOutcome::Unauthorized(_) => Err(CoreError::Protocol("authentication required")),
+    }
+}
+
+/// Runs one client session, optionally presenting `secret` for authentication.
+///
+/// `stdio` holds the three descriptors (stdin, stdout, stderr) to delegate. For
+/// a non-interactive session these are the client's own standard streams; for
+/// an interactive session they are the client's terminal, which the daemon
+/// bridges to the pty it allocates.
+pub async fn run_session(
+    transport: &mut dyn Transport,
+    request: &ClientRequest,
+    stdio: [BorrowedFd<'_>; 3],
+    secret: Option<&str>,
+) -> Result<SessionOutcome> {
+    // An authenticating front-end may reject and close the connection after the
+    // first non-secret message, so a send failure is not necessarily fatal — the
+    // auth challenge may already be waiting to be read. Try the read regardless,
+    // and only surface the send error if nothing useful came back.
+    let send_result = send_configuration(transport, request, stdio, secret).await;
 
     // For an interactive session, forward terminal resizes for as long as the
     // session lasts. The task borrows nothing from this scope (it copies the
     // terminal fd), so it can outlive a single recv and is aborted on return.
-    let winch_task = match (request.winsize.is_some(), transport.control_sender()) {
+    let winch_task = match (
+        send_result.is_ok() && request.winsize.is_some(),
+        transport.control_sender(),
+    ) {
         (true, Some(sender)) => Some(spawn_winch_forwarder(sender, stdio[0].as_raw_fd())),
         _ => None,
     };
 
-    let result = await_exit(transport).await;
+    let result = await_outcome(transport).await;
 
     if let Some(task) = winch_task {
         task.abort();
     }
-    result
+
+    match (result, send_result) {
+        (Ok(outcome), _) => Ok(outcome),
+        (Err(recv_err), Ok(())) => Err(recv_err),
+        (Err(_), Err(send_err)) => Err(send_err),
+    }
 }
 
-/// Waits for the daemon's exit (or error) messages.
-async fn await_exit(transport: &mut dyn Transport) -> Result<i32> {
+/// Waits for the daemon's terminal message (exit, or an auth challenge).
+async fn await_outcome(transport: &mut dyn Transport) -> Result<SessionOutcome> {
     loop {
         let Some(received) = transport.recv().await? else {
             return Err(CoreError::DaemonClosed);
         };
 
         match received.message.field_type() {
-            FieldType::Exit => return Ok(received.message.as_i32()?),
+            FieldType::Exit => return Ok(SessionOutcome::Exited(received.message.as_i32()?)),
+            FieldType::Unauthorized => {
+                let prompt = received.message.as_str().unwrap_or("password: ").to_owned();
+                return Ok(SessionOutcome::Unauthorized(prompt));
+            }
             FieldType::Error => {
                 eprintln!(
                     "capsudo: error: {}",
@@ -85,13 +125,18 @@ async fn await_exit(transport: &mut dyn Transport) -> Result<i32> {
     }
 }
 
-/// Sends the configuration handshake: env, args, session type, window size (if
-/// interactive), the stdio descriptors, then `End`.
+/// Sends the configuration handshake: secret (if any), env, args, session type,
+/// window size (if interactive), the stdio descriptors, then `End`.
 async fn send_configuration(
     transport: &mut dyn Transport,
     request: &ClientRequest,
     stdio: [BorrowedFd<'_>; 3],
+    secret: Option<&str>,
 ) -> Result<()> {
+    if let Some(secret) = secret {
+        transport.send(&Message::secret(secret), &[]).await?;
+    }
+
     for entry in &request.env {
         transport.send(&Message::env(entry), &[]).await?;
     }

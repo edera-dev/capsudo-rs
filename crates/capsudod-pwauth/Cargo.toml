@@ -1,0 +1,19 @@
+[package]
+name = "capsudod-pwauth"
+description = "Authenticating front-end for capsudo: shadow-password check, then chain to capsudod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "capsudod-pwauth"
+path = "src/main.rs"
+
+[dependencies]
+capsudo-proto.workspace = true
+capsudo-transport.workspace = true
+tokio.workspace = true
+nix.workspace = true
+libc.workspace = true
