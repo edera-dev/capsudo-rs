@@ -1,0 +1,19 @@
+[package]
+name = "capsudo-transport"
+description = "Transport abstraction for capsudo: local Unix sockets today, cross-zone IDM tomorrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+capsudo-proto.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+nix.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,211 @@
+//! Local transport over an `AF_UNIX` `SOCK_STREAM` socket.
+//!
+//! This is the "fast path": file descriptors passed to [`Transport::send`] ride
+//! as real `SCM_RIGHTS` ancillary data, exactly as the C implementation does, so
+//! the daemon's child ends up sharing the client's actual terminal/pipes.
+
+use std::io::{self, IoSlice, IoSliceMut};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+use async_trait::async_trait;
+use capsudo_proto::{Header, Message};
+use nix::cmsg_space;
+use nix::sys::socket::{
+    getsockopt, recvmsg, sendmsg, sockopt, ControlMessage, ControlMessageOwned, MsgFlags,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
+
+use crate::error::{Result, TransportError};
+use crate::traits::{Listener, PeerCred, Received, Transport};
+
+/// Maximum number of descriptors we will receive with a single message. The
+/// protocol only ever delegates the three stdio descriptors.
+const MAX_SCM_FDS: usize = 3;
+
+/// A capsudo [`Transport`] backed by a connected Unix-domain stream socket.
+pub struct UnixTransport {
+    stream: UnixStream,
+}
+
+impl UnixTransport {
+    /// Wraps an already-connected tokio [`UnixStream`].
+    pub fn new(stream: UnixStream) -> UnixTransport {
+        UnixTransport { stream }
+    }
+
+    /// Connects to a capsudo daemon listening at `path`.
+    pub async fn connect(path: impl AsRef<Path>) -> Result<UnixTransport> {
+        let stream = UnixStream::connect(path).await?;
+        Ok(UnixTransport::new(stream))
+    }
+
+    /// Reads one message header, capturing any `SCM_RIGHTS` descriptors that
+    /// arrive with it. Returns `Ok(None)` on a clean EOF at a frame boundary.
+    async fn recv_header(&mut self) -> Result<Option<(Header, Vec<OwnedFd>)>> {
+        let fd = self.stream.as_raw_fd();
+        let mut hdr = [0u8; Header::SIZE];
+        let mut filled = 0usize;
+        let mut owned: Vec<OwnedFd> = Vec::new();
+
+        while filled < Header::SIZE {
+            self.stream.readable().await?;
+
+            let res = self.stream.try_io(Interest::READABLE, || {
+                let mut cmsg = cmsg_space!([RawFd; MAX_SCM_FDS]);
+                let mut iov = [IoSliceMut::new(&mut hdr[filled..])];
+                let msg = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())
+                    .map_err(io::Error::from)?;
+
+                let mut got: Vec<RawFd> = Vec::new();
+                for cmsg in msg.cmsgs().map_err(io::Error::from)? {
+                    if let ControlMessageOwned::ScmRights(rfds) = cmsg {
+                        got.extend_from_slice(&rfds);
+                    }
+                }
+                Ok((msg.bytes, got))
+            });
+
+            match res {
+                Ok((0, _)) => {
+                    if filled == 0 && owned.is_empty() {
+                        return Ok(None);
+                    }
+                    return Err(TransportError::UnexpectedEof);
+                }
+                Ok((n, got)) => {
+                    filled += n;
+                    // SAFETY: each RawFd was just installed into our process by
+                    // the kernel via SCM_RIGHTS; we take sole ownership.
+                    for raw in got {
+                        owned.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(Some((Header::decode(&hdr)?, owned)))
+    }
+}
+
+#[async_trait]
+impl Transport for UnixTransport {
+    async fn send(&mut self, msg: &Message, fds: &[BorrowedFd<'_>]) -> Result<()> {
+        let buf = msg.encode();
+        let fd = self.stream.as_raw_fd();
+        let mut offset = 0usize;
+
+        if !fds.is_empty() {
+            let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+
+            // The ancillary descriptors ride with the first sendmsg. A short
+            // write is possible; the remainder is sent below without ancillary,
+            // since the kernel delivers the fds with the first byte.
+            loop {
+                self.stream.writable().await?;
+                let res = self.stream.try_io(Interest::WRITABLE, || {
+                    let iov = [IoSlice::new(&buf[offset..])];
+                    let cmsgs = [ControlMessage::ScmRights(&raw)];
+                    sendmsg::<()>(fd, &iov, &cmsgs, MsgFlags::empty(), None)
+                        .map_err(io::Error::from)
+                });
+                match res {
+                    Ok(n) => {
+                        offset += n;
+                        break;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        if offset < buf.len() {
+            self.stream.write_all(&buf[offset..]).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<Received>> {
+        let (header, fds) = match self.recv_header().await? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut payload = vec![0u8; header.len as usize];
+        if header.len > 0 {
+            self.stream.read_exact(&mut payload).await.map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    TransportError::UnexpectedEof
+                } else {
+                    TransportError::Io(e)
+                }
+            })?;
+        }
+
+        Ok(Some(Received {
+            message: Message::new(header.field_type, payload),
+            fds,
+        }))
+    }
+
+    fn peer_cred(&self) -> Option<PeerCred> {
+        let creds = getsockopt(&self.stream, sockopt::PeerCredentials).ok()?;
+        Some(PeerCred {
+            pid: creds.pid(),
+            uid: creds.uid(),
+            gid: creds.gid(),
+        })
+    }
+}
+
+/// A [`Listener`] that accepts capsudo connections on a Unix-domain socket.
+///
+/// On [`bind`](UnixListener::bind) the socket's ownership and permission bits
+/// are set — these are the access-control mechanism: whoever can `connect()`
+/// holds the capability.
+pub struct UnixListener {
+    inner: TokioUnixListener,
+}
+
+impl UnixListener {
+    /// Binds and listens at `path`, applying optional ownership and a
+    /// permission mode. Any pre-existing socket at `path` is removed first.
+    pub fn bind(
+        path: impl AsRef<Path>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: u32,
+    ) -> Result<UnixListener> {
+        let path = path.as_ref();
+
+        // Mirror the C implementation: unlink a stale socket before binding.
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let inner = TokioUnixListener::bind(path)?;
+
+        if uid.is_some() || gid.is_some() {
+            std::os::unix::fs::chown(path, uid, gid)?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+
+        Ok(UnixListener { inner })
+    }
+}
+
+#[async_trait]
+impl Listener for UnixListener {
+    async fn accept(&mut self) -> Result<Box<dyn Transport>> {
+        let (stream, _addr) = self.inner.accept().await?;
+        Ok(Box::new(UnixTransport::new(stream)))
+    }
+}
