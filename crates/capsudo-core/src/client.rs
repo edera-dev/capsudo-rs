@@ -9,7 +9,7 @@
 use std::os::fd::BorrowedFd;
 
 use capsudo_proto::{FieldType, Message, SessionType};
-use capsudo_transport::Transport;
+use capsudo_transport::{FdSpec, Transport};
 
 use crate::error::{CoreError, Result};
 
@@ -74,7 +74,16 @@ async fn send_configuration(
     transport
         .send(&Message::session_type(request.session_type), &[])
         .await?;
-    transport.send(&Message::fds(3), &stdio).await?;
+
+    // stdio[0] is the program's input (we read it), stdio[1]/[2] its outputs (we
+    // write them). Tagging the directions lets a multiplexing transport pump
+    // each the right way; the local transport ignores the tags.
+    let fds = [
+        FdSpec::read(stdio[0]),
+        FdSpec::write(stdio[1]),
+        FdSpec::write(stdio[2]),
+    ];
+    transport.send(&Message::fds(3), &fds).await?;
     transport.send(&Message::end(), &[]).await?;
     Ok(())
 }

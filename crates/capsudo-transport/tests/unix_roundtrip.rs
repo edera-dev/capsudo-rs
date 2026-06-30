@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 
 use capsudo_proto::{FieldType, Message};
-use capsudo_transport::{Listener, Transport, UnixListener, UnixTransport};
+use capsudo_transport::{FdSpec, Listener, Transport, UnixListener, UnixTransport};
 
 fn temp_sock(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("capsudo-test-{}-{}.sock", std::process::id(), tag))
@@ -34,7 +34,7 @@ async fn passes_payload_and_descriptor() {
     let (rd, wr) = nix::unistd::pipe().unwrap();
     let mut client = UnixTransport::connect(&path).await.unwrap();
     client
-        .send(&Message::arg("hello"), &[wr.as_fd()])
+        .send(&Message::arg("hello"), &[FdSpec::write(wr.as_fd())])
         .await
         .unwrap();
 

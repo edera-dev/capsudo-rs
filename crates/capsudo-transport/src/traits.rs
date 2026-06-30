@@ -20,6 +20,74 @@ pub struct Received {
     pub fds: Vec<OwnedFd>,
 }
 
+/// Which way bytes flow through a delegated descriptor, from the perspective of
+/// the side that currently holds it.
+///
+/// A local `SCM_RIGHTS` transport ignores this — it ships the descriptor itself.
+/// A multiplexing transport needs it: it must not, for example, *read* a
+/// write-only stdout descriptor (on a tty that would steal the user's input).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FdDir {
+    /// The holder reads from this descriptor (e.g. a program's stdin source).
+    Read,
+    /// The holder writes to this descriptor (e.g. a program's stdout sink).
+    Write,
+    /// The holder both reads and writes (e.g. a pty).
+    ReadWrite,
+}
+
+impl FdDir {
+    /// Whether this direction involves reading.
+    pub fn reads(self) -> bool {
+        matches!(self, FdDir::Read | FdDir::ReadWrite)
+    }
+
+    /// Whether this direction involves writing.
+    pub fn writes(self) -> bool {
+        matches!(self, FdDir::Write | FdDir::ReadWrite)
+    }
+
+    /// The mirror direction seen by the peer: what one side reads, the other
+    /// writes, and vice versa.
+    pub fn invert(self) -> FdDir {
+        match self {
+            FdDir::Read => FdDir::Write,
+            FdDir::Write => FdDir::Read,
+            FdDir::ReadWrite => FdDir::ReadWrite,
+        }
+    }
+}
+
+/// A descriptor offered to [`Transport::send`] for delegation, tagged with the
+/// direction bytes flow through it.
+#[derive(Clone, Copy)]
+pub struct FdSpec<'a> {
+    /// The descriptor to delegate.
+    pub fd: BorrowedFd<'a>,
+    /// How the holder uses it.
+    pub dir: FdDir,
+}
+
+impl<'a> FdSpec<'a> {
+    /// A read-only descriptor (e.g. stdin).
+    pub fn read(fd: BorrowedFd<'a>) -> FdSpec<'a> {
+        FdSpec { fd, dir: FdDir::Read }
+    }
+
+    /// A write-only descriptor (e.g. stdout/stderr).
+    pub fn write(fd: BorrowedFd<'a>) -> FdSpec<'a> {
+        FdSpec { fd, dir: FdDir::Write }
+    }
+
+    /// A bidirectional descriptor (e.g. a pty).
+    pub fn read_write(fd: BorrowedFd<'a>) -> FdSpec<'a> {
+        FdSpec {
+            fd,
+            dir: FdDir::ReadWrite,
+        }
+    }
+}
+
 /// Peer credentials, where the transport can establish them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerCred {
@@ -45,8 +113,9 @@ pub trait Transport: Send {
     ///
     /// Passing a non-empty `fds` is a request to *delegate those descriptors to
     /// the peer*. How that is realized is the transport's business (real
-    /// `SCM_RIGHTS` vs. simulated streams).
-    async fn send(&mut self, msg: &Message, fds: &[BorrowedFd<'_>]) -> Result<()>;
+    /// `SCM_RIGHTS` vs. simulated streams). Each descriptor is tagged with its
+    /// [`FdDir`] so a multiplexing transport knows which way to pump it.
+    async fn send(&mut self, msg: &Message, fds: &[FdSpec<'_>]) -> Result<()>;
 
     /// Receives the next message, or `Ok(None)` on a clean end-of-stream.
     async fn recv(&mut self) -> Result<Option<Received>>;

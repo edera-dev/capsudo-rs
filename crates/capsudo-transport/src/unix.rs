@@ -5,7 +5,7 @@
 //! the daemon's child ends up sharing the client's actual terminal/pipes.
 
 use std::io::{self, IoSlice, IoSliceMut};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 
 use crate::error::{Result, TransportError};
-use crate::traits::{Listener, PeerCred, Received, Transport};
+use crate::traits::{FdSpec, Listener, PeerCred, Received, Transport};
 
 /// Maximum number of descriptors we will receive with a single message. The
 /// protocol only ever delegates the three stdio descriptors.
@@ -94,13 +94,15 @@ impl UnixTransport {
 
 #[async_trait]
 impl Transport for UnixTransport {
-    async fn send(&mut self, msg: &Message, fds: &[BorrowedFd<'_>]) -> Result<()> {
+    async fn send(&mut self, msg: &Message, fds: &[FdSpec<'_>]) -> Result<()> {
         let buf = msg.encode();
         let fd = self.stream.as_raw_fd();
         let mut offset = 0usize;
 
         if !fds.is_empty() {
-            let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+            // The local transport ships the descriptors themselves; direction is
+            // irrelevant once the peer holds the real fd.
+            let raw: Vec<RawFd> = fds.iter().map(|s| s.fd.as_raw_fd()).collect();
 
             // The ancillary descriptors ride with the first sendmsg. A short
             // write is possible; the remainder is sent below without ancillary,

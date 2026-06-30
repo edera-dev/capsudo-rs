@@ -17,5 +17,10 @@ mod traits;
 pub mod unix;
 
 pub use error::{Result, TransportError};
-pub use traits::{Listener, PeerCred, Received, Transport};
+pub use traits::{FdDir, FdSpec, Listener, PeerCred, Received, Transport};
 pub use unix::{UnixListener, UnixTransport};
+
+pub mod mux;
+
+#[cfg(feature = "idm")]
+pub mod idm;
