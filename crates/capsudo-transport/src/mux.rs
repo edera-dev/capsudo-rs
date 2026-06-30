@@ -36,7 +36,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, TransportError};
-use crate::traits::{FdDir, FdSpec, Received, Transport};
+use crate::traits::{ControlSender, FdDir, FdSpec, Received, Transport};
 
 const KIND_CONTROL: u8 = 1;
 const KIND_FDS: u8 = 2;
@@ -195,6 +195,28 @@ impl Transport for MuxTransport {
                 fds,
             })),
         }
+    }
+
+    fn control_sender(&self) -> Option<Box<dyn ControlSender>> {
+        Some(Box::new(MuxControlSender {
+            frame_tx: self.frame_tx.clone(),
+        }))
+    }
+}
+
+/// Sends control frames by cloning the multiplexer's outbound channel; ordered
+/// with all other frames by the single writer task.
+struct MuxControlSender {
+    frame_tx: mpsc::Sender<OutFrame>,
+}
+
+#[async_trait]
+impl ControlSender for MuxControlSender {
+    async fn send_control(&self, msg: Message) -> Result<()> {
+        self.frame_tx
+            .send(OutFrame::Control(msg.encode()))
+            .await
+            .map_err(|_| TransportError::UnexpectedEof)
     }
 }
 

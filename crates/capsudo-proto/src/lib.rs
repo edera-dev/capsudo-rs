@@ -61,6 +61,10 @@ pub enum FieldType {
     Secret = 7,
     /// Authentication is required/failed; payload is the prompt to display.
     Unauthorized = 8,
+    /// Terminal window dimensions for an interactive session. Payload: four
+    /// `u16` little-endian fields — rows, cols, xpixels, ypixels — matching
+    /// `struct winsize`. Sent at startup and again on each resize.
+    Winsize = 9,
     /// Terminates the client's configuration phase; the daemon may now act.
     End = 255,
 }
@@ -85,6 +89,7 @@ impl TryFrom<u8> for FieldType {
             6 => FieldType::Error,
             7 => FieldType::Secret,
             8 => FieldType::Unauthorized,
+            9 => FieldType::Winsize,
             255 => FieldType::End,
             other => return Err(ProtoError::UnknownFieldType(other)),
         })
@@ -102,6 +107,7 @@ impl fmt::Debug for FieldType {
             FieldType::Error => "Error",
             FieldType::Secret => "Secret",
             FieldType::Unauthorized => "Unauthorized",
+            FieldType::Winsize => "Winsize",
             FieldType::End => "End",
         };
         write!(f, "{name}")
@@ -266,6 +272,15 @@ impl Message {
         Message::new(FieldType::Unauthorized, prompt.as_ref().as_bytes().to_vec())
     }
 
+    /// An [`FieldType::Winsize`] carrying `[rows, cols, xpixels, ypixels]`.
+    pub fn winsize(dims: [u16; 4]) -> Message {
+        let mut payload = Vec::with_capacity(8);
+        for field in dims {
+            payload.extend_from_slice(&field.to_le_bytes());
+        }
+        Message::new(FieldType::Winsize, payload)
+    }
+
     /// An [`FieldType::End`] marking the end of the configuration phase.
     pub fn end() -> Message {
         Message::new(FieldType::End, Vec::new())
@@ -301,6 +316,22 @@ impl Message {
             }
         })?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    /// Interprets the payload as terminal dimensions `[rows, cols, xpixels,
+    /// ypixels]`.
+    pub fn as_winsize(&self) -> Result<[u16; 4], ProtoError> {
+        if self.payload.len() != 8 {
+            return Err(ProtoError::InvalidPayload {
+                field_type: self.field_type,
+                reason: "expected 8-byte window size",
+            });
+        }
+        let mut dims = [0u16; 4];
+        for (i, dim) in dims.iter_mut().enumerate() {
+            *dim = u16::from_le_bytes([self.payload[i * 2], self.payload[i * 2 + 1]]);
+        }
+        Ok(dims)
     }
 
     /// Interprets the payload as a [`SessionType`].
@@ -364,6 +395,7 @@ mod tests {
             FieldType::Error,
             FieldType::Secret,
             FieldType::Unauthorized,
+            FieldType::Winsize,
             FieldType::End,
         ] {
             assert_eq!(FieldType::try_from(ft.as_u8()).unwrap(), ft);
@@ -425,6 +457,13 @@ mod tests {
                 .unwrap(),
             SessionType::Interactive
         );
+    }
+
+    #[test]
+    fn winsize_roundtrip() {
+        let msg = Message::winsize([24, 80, 640, 480]);
+        assert_eq!(msg.field_type(), FieldType::Winsize);
+        assert_eq!(msg.as_winsize().unwrap(), [24, 80, 640, 480]);
     }
 
     #[test]

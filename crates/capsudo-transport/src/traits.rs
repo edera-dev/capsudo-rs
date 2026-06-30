@@ -133,6 +133,25 @@ pub trait Transport: Send {
     fn peer_secontext(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Returns a detached handle for sending fd-less control messages
+    /// concurrently with [`recv`](Transport::recv).
+    ///
+    /// Interactive clients need this: they sit in `recv()` awaiting the exit
+    /// status while also pushing [`Winsize`](capsudo_proto::FieldType::Winsize)
+    /// updates on `SIGWINCH`. Returns `None` if the transport cannot split
+    /// sending from receiving.
+    fn control_sender(&self) -> Option<Box<dyn ControlSender>> {
+        None
+    }
+}
+
+/// A detached sink for fd-less control messages, usable from another task while
+/// the owning [`Transport`] is parked in [`recv`](Transport::recv).
+#[async_trait]
+pub trait ControlSender: Send + Sync {
+    /// Sends one control message. Descriptors cannot be sent through this path.
+    async fn send_control(&self, msg: Message) -> Result<()>;
 }
 
 /// Accepts inbound capsudo connections, yielding a [`Transport`] per peer.

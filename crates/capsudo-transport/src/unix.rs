@@ -5,9 +5,10 @@
 //! the daemon's child ends up sharing the client's actual terminal/pipes.
 
 use std::io::{self, IoSlice, IoSliceMut};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use capsudo_proto::{Header, Message};
@@ -19,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 
 use crate::error::{Result, TransportError};
-use crate::traits::{FdSpec, Listener, PeerCred, Received, Transport};
+use crate::traits::{ControlSender, FdSpec, Listener, PeerCred, Received, Transport};
 
 /// Maximum number of descriptors we will receive with a single message. The
 /// protocol only ever delegates the three stdio descriptors.
@@ -163,6 +164,44 @@ impl Transport for UnixTransport {
             uid: creds.uid(),
             gid: creds.gid(),
         })
+    }
+
+    fn control_sender(&self) -> Option<Box<dyn ControlSender>> {
+        // A dup writes to the same socket independently of the receiving path.
+        // Safe here because the only post-handshake writes are winsize updates;
+        // the main task only reads.
+        let dup = nix::unistd::dup(self.stream.as_raw_fd()).ok()?;
+        let fd = unsafe { OwnedFd::from_raw_fd(dup) };
+        Some(Box::new(UnixControlSender { fd: Arc::new(fd) }))
+    }
+}
+
+/// Sends control messages over a dup of the connection's socket via a blocking
+/// write (messages are small and infrequent).
+struct UnixControlSender {
+    fd: Arc<OwnedFd>,
+}
+
+#[async_trait]
+impl ControlSender for UnixControlSender {
+    async fn send_control(&self, msg: Message) -> Result<()> {
+        let buf = msg.encode();
+        let fd = self.fd.clone();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let mut offset = 0;
+            while offset < buf.len() {
+                match nix::unistd::write(fd.as_fd(), &buf[offset..]) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => offset += n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => return Err(io::Error::from(e)),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| TransportError::Other(format!("control send task failed: {e}")))??;
+        Ok(())
     }
 }
 

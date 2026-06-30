@@ -17,7 +17,7 @@ mod traits;
 pub mod unix;
 
 pub use error::{Result, TransportError};
-pub use traits::{FdDir, FdSpec, Listener, PeerCred, Received, Transport};
+pub use traits::{ControlSender, FdDir, FdSpec, Listener, PeerCred, Received, Transport};
 pub use unix::{UnixListener, UnixTransport};
 
 pub mod mux;

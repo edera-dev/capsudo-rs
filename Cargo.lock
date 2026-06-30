@@ -48,6 +48,8 @@ version = "0.1.0"
 dependencies = [
  "capsudo-proto",
  "capsudo-transport",
+ "libc",
+ "nix",
  "thiserror",
  "tokio",
 ]

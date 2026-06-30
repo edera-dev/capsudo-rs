@@ -6,14 +6,18 @@
 //! the exit status back.
 
 use std::os::fd::OwnedFd;
-use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 
-use capsudo_proto::{FieldType, Message, SessionType};
+use capsudo_proto::{FieldType, SessionType};
 use capsudo_transport::Transport;
 use tokio::process::Command;
 
 use crate::error::{CoreError, Result};
+use crate::exit::{exit_code, send_error, send_exit};
+use crate::pty;
+
+/// Default terminal size assumed if the client sends no window size.
+const DEFAULT_WINSIZE: [u16; 4] = [24, 80, 0, 0];
 
 /// Daemon-side policy applied to every session.
 #[derive(Default, Clone)]
@@ -34,9 +38,9 @@ pub struct DaemonConfig {
 struct SessionRequest {
     argv: Vec<String>,
     envp: Vec<String>,
-    #[allow(dead_code)] // consumed by interactive handling in a later step
     session_type: SessionType,
     stdio: [OwnedFd; 3],
+    winsize: [u16; 4],
 }
 
 /// Serves a single client connection: receives configuration, runs the
@@ -63,6 +67,7 @@ async fn receive_configuration(
     let mut envp = config.fixed_env.clone();
     let mut session_type = SessionType::NonInteractive;
     let mut stdio: Option<[OwnedFd; 3]> = None;
+    let mut winsize = DEFAULT_WINSIZE;
 
     loop {
         let Some(received) = transport.recv().await? else {
@@ -82,6 +87,9 @@ async fn receive_configuration(
             }
             FieldType::SessionType => {
                 session_type = received.message.as_session_type()?;
+            }
+            FieldType::Winsize => {
+                winsize = received.message.as_winsize()?;
             }
             FieldType::Fd => {
                 stdio = Some(received.fds.try_into().map_err(|_| {
@@ -107,11 +115,24 @@ async fn receive_configuration(
         envp,
         session_type,
         stdio,
+        winsize,
     })
 }
 
-/// Spawns the program and relays its exit status.
+/// Spawns the program and relays its exit status, choosing the interactive
+/// (pty) or non-interactive (direct stdio) path.
 async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) -> Result<()> {
+    if request.session_type == SessionType::Interactive {
+        return pty::run_interactive(
+            transport,
+            request.argv,
+            request.envp,
+            request.stdio,
+            request.winsize,
+        )
+        .await;
+    }
+
     let [child_stdin, child_stdout, child_stderr] = request.stdio;
 
     let mut command = Command::new(&request.argv[0]);
@@ -140,26 +161,4 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
 
     let status = child.wait().await?;
     send_exit(transport, exit_code(status)).await
-}
-
-/// Maps a process exit status to capsudo's reported code: the exit code if it
-/// exited normally, or `128 + signal` if it was killed.
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(signal) = status.signal() {
-        128 + signal
-    } else {
-        1
-    }
-}
-
-async fn send_error(transport: &mut dyn Transport, message: &str) -> Result<()> {
-    transport.send(&Message::error(message), &[]).await?;
-    Ok(())
-}
-
-async fn send_exit(transport: &mut dyn Transport, code: i32) -> Result<()> {
-    transport.send(&Message::exit(code), &[]).await?;
-    Ok(())
 }

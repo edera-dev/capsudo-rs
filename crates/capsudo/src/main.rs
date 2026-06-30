@@ -1,7 +1,7 @@
 //! capsudo client: connect to a capsudo daemon and invoke the capability it
 //! holds, delegating this process's stdio to the program it runs.
 
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::process::ExitCode;
 
 use capsudo_core::{run_client, ClientRequest};
@@ -21,6 +21,33 @@ const DEFAULT_ENV: &[&str] = &[
     "LC_MESSAGES",
     "COLORTERM",
 ];
+
+/// Puts a terminal into raw mode for the duration of a session, restoring the
+/// original settings on drop.
+struct RawMode {
+    fd: RawFd,
+    original: nix::sys::termios::Termios,
+}
+
+impl RawMode {
+    fn enable(fd: RawFd) -> Option<RawMode> {
+        use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let original = tcgetattr(borrowed).ok()?;
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(borrowed, SetArg::TCSANOW, &raw).ok()?;
+        Some(RawMode { fd, original })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        use nix::sys::termios::{tcsetattr, SetArg};
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
+        let _ = tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
+    }
+}
 
 struct Options {
     socket: String,
@@ -105,11 +132,24 @@ async fn main() -> ExitCode {
     append_default_env(&mut opts.env);
 
     let session_type = opts.session.unwrap_or_else(determine_session_type);
+    let interactive = session_type == SessionType::Interactive;
+
+    // For an interactive session, capture the terminal size and put our own
+    // terminal into raw mode so keystrokes pass through to the daemon's pty
+    // unmodified. The guard restores the terminal on return.
+    let mut request_winsize = None;
+    let _raw_guard = if interactive {
+        request_winsize = capsudo_core::read_winsize(std::io::stdin().as_raw_fd());
+        RawMode::enable(std::io::stdin().as_raw_fd())
+    } else {
+        None
+    };
 
     let request = ClientRequest {
         args: opts.args,
         env: opts.env,
         session_type,
+        winsize: request_winsize,
     };
 
     let mut transport = match UnixTransport::connect(&opts.socket).await {
@@ -120,8 +160,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Non-interactive: delegate our own standard streams. (Interactive pty
-    // allocation arrives in a later step.)
+    // Delegate our own standard streams; for an interactive session these are
+    // our terminal, which the daemon bridges to the pty it allocates.
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();

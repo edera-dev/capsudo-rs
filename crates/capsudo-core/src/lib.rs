@@ -8,7 +8,9 @@
 mod client;
 mod daemon;
 mod error;
+mod exit;
+mod pty;
 
-pub use client::{run_client, ClientRequest};
+pub use client::{read_winsize, run_client, ClientRequest};
 pub use daemon::{serve_connection, DaemonConfig};
 pub use error::{CoreError, Result};

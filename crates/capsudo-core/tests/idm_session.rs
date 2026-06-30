@@ -39,6 +39,7 @@ async fn cat_round_trips_over_idm_stub() {
         args: vec!["cat".to_owned()],
         env: Vec::new(),
         session_type: SessionType::NonInteractive,
+        winsize: None,
     };
 
     let stdio = [stdin_r.as_fd(), stdout_w.as_fd(), devnull.as_fd()];
