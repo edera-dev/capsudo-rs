@@ -32,6 +32,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
+name = "capsudo"
+version = "0.1.0"
+dependencies = [
+ "capsudo-core",
+ "capsudo-proto",
+ "capsudo-transport",
+ "nix",
+ "tokio",
+]
+
+[[package]]
+name = "capsudo-core"
+version = "0.1.0"
+dependencies = [
+ "capsudo-proto",
+ "capsudo-transport",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "capsudo-proto"
 version = "0.1.0"
 dependencies = [
@@ -47,6 +68,15 @@ dependencies = [
  "libc",
  "nix",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "capsudod"
+version = "0.1.0"
+dependencies = [
+ "capsudo-core",
+ "capsudo-transport",
  "tokio",
 ]
 

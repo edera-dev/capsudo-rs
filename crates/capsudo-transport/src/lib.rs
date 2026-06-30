@@ -12,6 +12,7 @@
 //!   client nor daemon needs to know.
 
 mod error;
+pub mod ownerspec;
 mod traits;
 pub mod unix;
 

@@ -1,0 +1,17 @@
+[package]
+name = "capsudod"
+description = "capsudo daemon: hold a capability and run it for whoever can reach the socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "capsudod"
+path = "src/main.rs"
+
+[dependencies]
+capsudo-transport.workspace = true
+capsudo-core.workspace = true
+tokio.workspace = true
