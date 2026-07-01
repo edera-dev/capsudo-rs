@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [features]
 # A throwaway cross-zone transport stub built on the multiplexer, standing in

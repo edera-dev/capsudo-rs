@@ -14,6 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "0BSD"
 authors = ["Edera, Inc."]
+homepage = "https://github.com/edera-dev/capsudo-rs"
 repository = "https://github.com/edera-dev/capsudo-rs"
 
 [workspace.dependencies]
