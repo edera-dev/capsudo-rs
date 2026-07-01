@@ -1,0 +1,17 @@
+[workspace]
+pr_branch_prefix = "release/"
+pr_labels = ["release"]
+release_always = true
+git_release_enable = false
+git_tag_enable = false
+changelog_update = false
+
+# All crates share the workspace version, so the flagship `capsudo` crate drives
+# a single `vX.Y.Z` git tag and GitHub release for the whole workspace, while
+# release-plz still publishes every crate to crates.io (in dependency order).
+[[package]]
+name = "capsudo"
+git_release_name = "v{{ version }}"
+git_tag_name = "v{{ version }}"
+git_tag_enable = true
+git_release_enable = true
