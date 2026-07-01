@@ -14,14 +14,12 @@
 //! the delegated descriptors — directly.
 
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use capsudo_proto::{FieldType, Message};
 use capsudo_transport::ownerspec::{parse_mode, parse_owner_spec};
-use capsudo_transport::{Transport, UnixTransport};
+use capsudo_transport::{Transport, UnixListener, UnixTransport};
 use nix::unistd::{Uid, User};
-use tokio::net::UnixListener;
 
 mod shadow;
 
@@ -96,12 +94,9 @@ fn parse_options() -> Options {
 }
 
 fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
-        return "localhost".to_owned();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    nix::unistd::gethostname()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "localhost".to_owned())
 }
 
 fn auth_prompt(user: &str) -> String {
@@ -116,9 +111,7 @@ async fn fail(transport: &mut UnixTransport, message: &str) {
 }
 
 /// Handles one client: authenticate, then chain to capsudod on success.
-async fn handle_client(stream: tokio::net::UnixStream, capsudod_cmd: Vec<String>) {
-    let mut transport = UnixTransport::new(stream);
-
+async fn handle_client(mut transport: UnixTransport, capsudod_cmd: Vec<String>) {
     let Some(cred) = transport.peer_cred() else {
         fail(&mut transport, "unable to determine peer credentials").await;
         return;
@@ -160,7 +153,9 @@ async fn handle_client(stream: tokio::net::UnixStream, capsudod_cmd: Vec<String>
     command.args(&capsudod_cmd[1..]);
     command.stdin(Stdio::from(fd));
     // Inherit stdout/stderr for diagnostics; we do not wait (SIGCHLD ignored).
-    let _ = command.spawn();
+    if let Err(e) = command.spawn() {
+        eprintln!("capsudod-pwauth: cannot spawn {}: {e}", capsudod_cmd[0]);
+    }
 }
 
 #[tokio::main]
@@ -176,8 +171,7 @@ async fn main() {
         usage();
     };
 
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
+    let mut listener = match UnixListener::bind(&socket, opts.uid, opts.gid, opts.mode) {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("capsudod-pwauth: cannot bind {socket}: {e}");
@@ -185,22 +179,11 @@ async fn main() {
         }
     };
 
-    if opts.uid.is_some() || opts.gid.is_some() {
-        if let Err(e) = std::os::unix::fs::chown(&socket, opts.uid, opts.gid) {
-            eprintln!("capsudod-pwauth: chown {socket}: {e}");
-            std::process::exit(1);
-        }
-    }
-    if let Err(e) = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(opts.mode)) {
-        eprintln!("capsudod-pwauth: chmod {socket}: {e}");
-        std::process::exit(1);
-    }
-
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
+        match listener.accept_unix().await {
+            Ok(transport) => {
                 let cmd = opts.capsudod_cmd.clone();
-                tokio::spawn(handle_client(stream, cmd));
+                tokio::spawn(handle_client(transport, cmd));
             }
             Err(e) => eprintln!("capsudod-pwauth: accept failed: {e}"),
         }

@@ -20,10 +20,9 @@ use std::thread::JoinHandle;
 use capsudo_proto::FieldType;
 use capsudo_transport::Transport;
 use nix::pty::openpty;
-use tokio::process::Command;
 
 use crate::error::{CoreError, Result};
-use crate::exit::{exit_code, send_exit};
+use crate::exit::{exit_code, send_exit, send_spawn_failure};
 
 const BRIDGE_BUF: usize = 8192;
 
@@ -52,14 +51,7 @@ pub(crate) async fn run_interactive(
     let master = pty.master;
     let slave = pty.slave;
 
-    let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]);
-    command.env_clear();
-    for entry in &envp {
-        if let Some((key, value)) = entry.split_once('=') {
-            command.env(key, value);
-        }
-    }
+    let mut command = crate::daemon::build_command(&argv, &envp);
 
     // The child's stdio is the pty slave; it becomes a session leader with the
     // slave as its controlling terminal.
@@ -83,11 +75,7 @@ pub(crate) async fn run_interactive(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            let _ = crate::exit::send_error(transport, &format!("unable to run {}: {e}", argv[0]))
-                .await;
-            return send_exit(transport, 127).await;
-        }
+        Err(e) => return send_spawn_failure(transport, &argv[0], &e).await,
     };
 
     // Release the parent's copies of the slave (still held inside `command`'s

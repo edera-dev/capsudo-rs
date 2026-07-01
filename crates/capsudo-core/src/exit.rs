@@ -29,3 +29,14 @@ pub(crate) async fn send_exit(transport: &mut dyn Transport, code: i32) -> Resul
     transport.send(&Message::exit(code), &[]).await?;
     Ok(())
 }
+
+/// Reports a failed program spawn to the client: a human-readable error
+/// followed by the conventional exit code 127.
+pub(crate) async fn send_spawn_failure(
+    transport: &mut dyn Transport,
+    program: &str,
+    err: &std::io::Error,
+) -> Result<()> {
+    let _ = send_error(transport, &format!("unable to run {program}: {err}")).await;
+    send_exit(transport, 127).await
+}

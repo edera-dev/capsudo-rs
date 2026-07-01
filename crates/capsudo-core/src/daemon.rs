@@ -13,7 +13,7 @@ use capsudo_transport::Transport;
 use tokio::process::Command;
 
 use crate::error::{CoreError, Result};
-use crate::exit::{exit_code, send_error, send_exit};
+use crate::exit::{exit_code, send_error, send_exit, send_spawn_failure};
 use crate::pty;
 
 /// Default terminal size assumed if the client sends no window size.
@@ -43,6 +43,22 @@ struct SessionRequest {
     winsize: [u16; 4],
     /// SELinux context of the connecting peer, to run the child under.
     secontext: Option<Vec<u8>>,
+}
+
+/// Builds the target program's [`Command`], shared by the interactive and
+/// non-interactive paths. Exactly the delegated environment is installed; the
+/// daemon's own environment is not inherited (mirrors execvpe with an explicit
+/// envp).
+pub(crate) fn build_command(argv: &[String], envp: &[String]) -> Command {
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.env_clear();
+    for entry in envp {
+        if let Some((key, value)) = entry.split_once('=') {
+            command.env(key, value);
+        }
+    }
+    command
 }
 
 /// Applies an SELinux exec context in the just-forked child via
@@ -163,18 +179,7 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
 
     let [child_stdin, child_stdout, child_stderr] = request.stdio;
 
-    let mut command = Command::new(&request.argv[0]);
-    command.args(&request.argv[1..]);
-
-    // Exactly the delegated environment is installed; the daemon's own
-    // environment is not inherited (mirrors execvpe with an explicit envp).
-    command.env_clear();
-    for entry in &request.envp {
-        if let Some((key, value)) = entry.split_once('=') {
-            command.env(key, value);
-        }
-    }
-
+    let mut command = build_command(&request.argv, &request.envp);
     command.stdin(Stdio::from(child_stdin));
     command.stdout(Stdio::from(child_stdout));
     command.stderr(Stdio::from(child_stderr));
@@ -187,14 +192,7 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            let _ = send_error(
-                transport,
-                &format!("unable to run {}: {e}", request.argv[0]),
-            )
-            .await;
-            return send_exit(transport, 127).await;
-        }
+        Err(e) => return send_spawn_failure(transport, &request.argv[0], &e).await,
     };
 
     let status = child.wait().await?;

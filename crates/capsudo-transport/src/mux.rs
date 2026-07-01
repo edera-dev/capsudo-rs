@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -428,10 +428,8 @@ async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<Str
                         Ok(guard) => guard,
                         Err(_) => return,
                     };
-                    let raw = fd.get_ref().as_raw_fd();
                     match guard.try_io(|_| {
-                        nix::unistd::write(unsafe { BorrowedFd::borrow_raw(raw) }, &bytes[offset..])
-                            .map_err(io::Error::from)
+                        nix::unistd::write(fd.get_ref(), &bytes[offset..]).map_err(io::Error::from)
                     }) {
                         Ok(Ok(n)) => offset += n,
                         Ok(Err(_)) => return,
@@ -452,8 +450,6 @@ async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<Str
 }
 
 // ---- helpers ----------------------------------------------------------------
-
-use std::os::fd::AsFd;
 
 fn dup_owned(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     let owned = nix::unistd::dup(fd).map_err(io::Error::from)?;

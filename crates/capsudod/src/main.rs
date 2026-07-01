@@ -1,9 +1,8 @@
 //! capsudo daemon: bind a socket whose permissions are the capability, and run
 //! the delegated program for each client that connects.
 
-use std::process::ExitCode;
-
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::process::ExitCode;
 
 use capsudo_core::{serve_connection, DaemonConfig};
 use capsudo_transport::ownerspec::{parse_mode, parse_owner_spec};

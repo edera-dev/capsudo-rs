@@ -33,10 +33,11 @@ The crates form a strict dependency stack; lower layers know nothing of higher.
 
 ### `capsudo-proto` — the wire protocol (no I/O)
 
-`Message` = a `FieldType` tag + payload. Framing is a fixed 5-byte header (`u8`
-type + `u32` little-endian length) then payload — **explicitly little-endian and
-fixed-width** so a frame survives a zone hop unchanged (the C original writes raw
-native structs and silently assumes a shared ABI; this does not). `Fd` messages
+`Message` = a `FieldType` tag + payload. Framing is a fixed 8-byte header (`u32`
+little-endian type + `u32` little-endian length) then payload — **explicitly
+little-endian and fixed-width** so a frame survives a zone hop unchanged. The C
+implementation speaks this same format, so the two are byte-compatible on the
+wire. `Fd` messages
 carry only a *count*; the descriptors themselves are handled out-of-band by the
 transport.
 

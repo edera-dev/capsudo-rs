@@ -280,12 +280,20 @@ impl UnixListener {
 
         Ok(UnixListener { inner })
     }
+
+    /// Waits for and accepts the next connection as a concrete
+    /// [`UnixTransport`], for callers that need Unix-specific abilities
+    /// (peer credentials, reclaiming the socket via
+    /// [`into_inner`](UnixTransport::into_inner)).
+    pub async fn accept_unix(&mut self) -> Result<UnixTransport> {
+        let (stream, _addr) = self.inner.accept().await?;
+        Ok(UnixTransport::new(stream))
+    }
 }
 
 #[async_trait]
 impl Listener for UnixListener {
     async fn accept(&mut self) -> Result<Box<dyn Transport>> {
-        let (stream, _addr) = self.inner.accept().await?;
-        Ok(Box::new(UnixTransport::new(stream)))
+        Ok(Box::new(self.accept_unix().await?))
     }
 }

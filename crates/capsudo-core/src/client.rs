@@ -78,12 +78,12 @@ pub async fn run_session(
     // For an interactive session, forward terminal resizes for as long as the
     // session lasts. The task borrows nothing from this scope (it copies the
     // terminal fd), so it can outlive a single recv and is aborted on return.
-    let winch_task = match (
-        send_result.is_ok() && request.winsize.is_some(),
-        transport.control_sender(),
-    ) {
-        (true, Some(sender)) => Some(spawn_winch_forwarder(sender, stdio[0].as_raw_fd())),
-        _ => None,
+    let winch_task = if send_result.is_ok() && request.winsize.is_some() {
+        transport
+            .control_sender()
+            .map(|sender| spawn_winch_forwarder(sender, stdio[0].as_raw_fd()))
+    } else {
+        None
     };
 
     let result = await_outcome(transport).await;

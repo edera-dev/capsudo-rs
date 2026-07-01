@@ -44,7 +44,7 @@ pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 ///
 /// The discriminants are stable wire values (serialized as `u32` little-endian)
 /// and must never be reused.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u32)]
 pub enum FieldType {
     /// One element of the target program's argument vector (UTF-8, NUL-free).
@@ -56,8 +56,8 @@ pub enum FieldType {
     /// Announces that descriptors accompany this message out-of-band.
     /// Payload: `u32` little-endian count of descriptors.
     Fd = 4,
-    /// Selects interactive vs. non-interactive handling (payload: `u8`
-    /// [`SessionType`]).
+    /// Selects interactive vs. non-interactive handling (payload: `u32`
+    /// little-endian holding a [`SessionType`] value).
     SessionType = 5,
     /// A human-readable error string emitted by the daemon.
     Error = 6,
@@ -97,24 +97,6 @@ impl TryFrom<u32> for FieldType {
             255 => FieldType::End,
             other => return Err(ProtoError::UnknownFieldType(other)),
         })
-    }
-}
-
-impl fmt::Debug for FieldType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            FieldType::Arg => "Arg",
-            FieldType::Env => "Env",
-            FieldType::Exit => "Exit",
-            FieldType::Fd => "Fd",
-            FieldType::SessionType => "SessionType",
-            FieldType::Error => "Error",
-            FieldType::Secret => "Secret",
-            FieldType::Unauthorized => "Unauthorized",
-            FieldType::Winsize => "Winsize",
-            FieldType::End => "End",
-        };
-        write!(f, "{name}")
     }
 }
 
@@ -298,6 +280,18 @@ impl Message {
 
     // ---- typed accessors ----------------------------------------------------
 
+    /// The payload as a fixed-size byte array, or an [`ProtoError::InvalidPayload`]
+    /// naming `reason` if the length does not match.
+    fn fixed_payload<const N: usize>(&self, reason: &'static str) -> Result<[u8; N], ProtoError> {
+        self.payload
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProtoError::InvalidPayload {
+                field_type: self.field_type,
+                reason,
+            })
+    }
+
     /// Interprets the payload as UTF-8 text.
     pub fn as_str(&self) -> Result<&str, ProtoError> {
         std::str::from_utf8(&self.payload).map_err(|_| ProtoError::InvalidPayload {
@@ -308,42 +302,25 @@ impl Message {
 
     /// Interprets the payload as a little-endian `i32` (e.g. an exit code).
     pub fn as_i32(&self) -> Result<i32, ProtoError> {
-        let bytes: [u8; 4] =
-            self.payload
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtoError::InvalidPayload {
-                    field_type: self.field_type,
-                    reason: "expected 4-byte integer",
-                })?;
-        Ok(i32::from_le_bytes(bytes))
+        Ok(i32::from_le_bytes(
+            self.fixed_payload("expected 4-byte integer")?,
+        ))
     }
 
     /// Interprets the payload as a little-endian `u32` (e.g. an fd count).
     pub fn as_u32(&self) -> Result<u32, ProtoError> {
-        let bytes: [u8; 4] =
-            self.payload
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtoError::InvalidPayload {
-                    field_type: self.field_type,
-                    reason: "expected 4-byte integer",
-                })?;
-        Ok(u32::from_le_bytes(bytes))
+        Ok(u32::from_le_bytes(
+            self.fixed_payload("expected 4-byte integer")?,
+        ))
     }
 
     /// Interprets the payload as terminal dimensions `[rows, cols, xpixels,
     /// ypixels]`.
     pub fn as_winsize(&self) -> Result<[u16; 4], ProtoError> {
-        if self.payload.len() != 8 {
-            return Err(ProtoError::InvalidPayload {
-                field_type: self.field_type,
-                reason: "expected 8-byte window size",
-            });
-        }
+        let bytes: [u8; 8] = self.fixed_payload("expected 8-byte window size")?;
         let mut dims = [0u16; 4];
         for (i, dim) in dims.iter_mut().enumerate() {
-            *dim = u16::from_le_bytes([self.payload[i * 2], self.payload[i * 2 + 1]]);
+            *dim = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
         }
         Ok(dims)
     }
@@ -398,7 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn field_type_roundtrips_through_u8() {
+    fn field_type_roundtrips_through_u32() {
         for ft in [
             FieldType::Arg,
             FieldType::Env,

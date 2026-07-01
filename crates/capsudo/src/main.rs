@@ -1,7 +1,7 @@
 //! capsudo client: connect to a capsudo daemon and invoke the capability it
 //! holds, delegating this process's stdio to the program it runs.
 
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::process::ExitCode;
 
 use capsudo_core::{run_session, ClientRequest, SessionOutcome};
@@ -22,30 +22,28 @@ const DEFAULT_ENV: &[&str] = &[
     "COLORTERM",
 ];
 
-/// Puts a terminal into raw mode for the duration of a session, restoring the
-/// original settings on drop.
+/// Puts the terminal on stdin into raw mode for the duration of a session,
+/// restoring the original settings on drop.
 struct RawMode {
-    fd: RawFd,
     original: nix::sys::termios::Termios,
 }
 
 impl RawMode {
-    fn enable(fd: RawFd) -> Option<RawMode> {
+    fn enable() -> Option<RawMode> {
         use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-        let original = tcgetattr(borrowed).ok()?;
+        let stdin = std::io::stdin();
+        let original = tcgetattr(stdin.as_fd()).ok()?;
         let mut raw = original.clone();
         cfmakeraw(&mut raw);
-        tcsetattr(borrowed, SetArg::TCSANOW, &raw).ok()?;
-        Some(RawMode { fd, original })
+        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw).ok()?;
+        Some(RawMode { original })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
         use nix::sys::termios::{tcsetattr, SetArg};
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
-        let _ = tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
+        let _ = tcsetattr(std::io::stdin().as_fd(), SetArg::TCSANOW, &self.original);
     }
 }
 
@@ -140,7 +138,7 @@ async fn main() -> ExitCode {
     let mut request_winsize = None;
     let _raw_guard = if interactive {
         request_winsize = capsudo_core::read_winsize(std::io::stdin().as_raw_fd());
-        RawMode::enable(std::io::stdin().as_raw_fd())
+        RawMode::enable()
     } else {
         None
     };
@@ -172,7 +170,7 @@ async fn main() -> ExitCode {
 
         match run_session(&mut transport, &request, stdio, secret.as_deref()).await {
             Ok(SessionOutcome::Exited(code)) => {
-                return ExitCode::from(u8::try_from(code & 0xff).unwrap_or(0));
+                return ExitCode::from((code & 0xff) as u8);
             }
             Ok(SessionOutcome::Unauthorized(prompt)) => {
                 if secret.is_some() {
