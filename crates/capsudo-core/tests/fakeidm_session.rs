@@ -1,4 +1,4 @@
-//! Same end-to-end session as `mux_session`, but over the IDM transport stub
+//! Same end-to-end session as `mux_session`, but over the fake IDM transport
 //! (TCP), to confirm the cross-zone path works over a real socket rather than
 //! an in-process pipe.
 
@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use capsudo_core::{run_client, serve_connection, ClientRequest, DaemonConfig};
 use capsudo_proto::SessionType;
-use capsudo_transport::idm::{connect, IdmListener};
+use capsudo_transport::fakeidm::{connect, FakeIdmListener};
 use capsudo_transport::Listener;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cat_round_trips_over_idm_stub() {
-    let mut listener = IdmListener::bind("127.0.0.1:0").await.unwrap();
+async fn cat_round_trips_over_fakeidm() {
+    let mut listener = FakeIdmListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let server_task = tokio::spawn(async move {

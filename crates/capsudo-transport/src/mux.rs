@@ -19,8 +19,8 @@
 //! ```
 //!
 //! The channel underneath is any `AsyncRead + AsyncWrite`: a TCP socket, an
-//! in-process duplex pipe, or an Edera IDM ring. See [`crate::idm`] for the
-//! IDM-shaped wrapper.
+//! in-process duplex pipe, or an Edera IDM ring. See [`fakeidm`](crate::fakeidm)
+//! for a throwaway TCP-backed stand-in used in tests.
 
 use std::collections::HashMap;
 use std::io;

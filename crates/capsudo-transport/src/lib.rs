@@ -7,9 +7,10 @@
 //!
 //! * [`unix`] — a local `AF_UNIX` socket, using real `SCM_RIGHTS` to delegate
 //!   the caller's stdio descriptors; and
-//! * (forthcoming) a cross-zone Edera Protect IDM channel, which *simulates*
-//!   descriptor passing by multiplexing stream data — transparently, so neither
-//!   client nor daemon needs to know.
+//! * a cross-zone Edera Protect IDM channel (built into Protect itself), which
+//!   *simulates* descriptor passing by multiplexing stream data — transparently,
+//!   so neither client nor daemon needs to know. [`fakeidm`] is a throwaway
+//!   TCP-backed stand-in for exercising that path on one host.
 
 mod error;
 pub mod ownerspec;
@@ -22,5 +23,5 @@ pub use unix::{UnixListener, UnixTransport};
 
 pub mod mux;
 
-#[cfg(feature = "idm")]
-pub mod idm;
+#[cfg(feature = "fakeidm")]
+pub mod fakeidm;

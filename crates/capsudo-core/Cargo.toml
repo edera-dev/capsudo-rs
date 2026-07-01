@@ -17,4 +17,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-capsudo-transport = { workspace = true, features = ["idm"] }
+capsudo-transport = { workspace = true, features = ["fakeidm"] }

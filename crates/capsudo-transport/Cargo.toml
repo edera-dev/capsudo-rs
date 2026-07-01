@@ -8,9 +8,10 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-# A demonstrable cross-zone transport stub built on the multiplexer, standing in
-# for a real Edera Protect IDM channel with TCP. Off by default.
-idm = []
+# A throwaway cross-zone transport stub built on the multiplexer, standing in
+# for a real Edera Protect IDM channel with TCP. Off by default; not for shipping
+# (the real integration lives in Protect's zone agent).
+fakeidm = []
 
 [dependencies]
 capsudo-proto.workspace = true

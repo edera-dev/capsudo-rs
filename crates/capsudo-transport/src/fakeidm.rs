@@ -1,4 +1,4 @@
-//! Cross-zone transport stub, shaped like Edera Protect IDM.
+//! A **fake** cross-zone transport, shaped like Edera Protect IDM.
 //!
 //! Edera Protect runs workloads in isolated *zones*; IDM (inter-zone
 //! messaging) gives two zones a reliable, ordered, byte-oriented channel — but
@@ -7,17 +7,14 @@
 //! built for: it turns a bare byte channel into a capsudo transport, emulating
 //! descriptor passing with stream multiplexing.
 //!
-//! This module is a thin stand-in that uses TCP as the byte channel so the
-//! cross-zone path can be exercised on one host. Dropping in the real IDM
-//! transport is a matter of replacing the TCP connect/accept below with the IDM
-//! channel's open/accept — everything above the byte channel is unchanged,
-//! because [`MuxTransport::new`](crate::mux::MuxTransport::new) accepts any
+//! This module is a throwaway stand-in that uses TCP as the byte channel so the
+//! cross-zone path can be exercised on one host. The real integration lives in
+//! Protect (the zone agent proxies `/run/cap/<name>` over IDM); nothing here is
+//! meant to ship. Swapping the real thing in is a matter of replacing the TCP
+//! connect/accept below with the IDM channel's open/accept — everything above
+//! the byte channel is unchanged, because
+//! [`MuxTransport::new`](crate::mux::MuxTransport::new) accepts any
 //! `AsyncRead + AsyncWrite`.
-//!
-//! A capsudo *proxy* bridging zones is then just: accept a local `AF_UNIX`
-//! connection in zone A, open an IDM channel to zone B, and shuttle capsudo
-//! frames between them. The local side keeps using real `SCM_RIGHTS`; the IDM
-//! side multiplexes; the daemon in zone B is none the wiser.
 
 use async_trait::async_trait;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -26,24 +23,24 @@ use crate::error::Result;
 use crate::mux::{MuxTransport, Side};
 use crate::traits::{Listener, Transport};
 
-/// Connects to a capsudo daemon reachable over the (stubbed) IDM channel and
-/// returns a multiplexing transport for it.
+/// Connects to a capsudo daemon reachable over the fake IDM channel and returns
+/// a multiplexing transport for it.
 pub async fn connect(addr: impl ToSocketAddrs) -> Result<MuxTransport> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
     Ok(MuxTransport::new(stream, Side::Dialer))
 }
 
-/// Accepts capsudo connections arriving over the (stubbed) IDM channel.
-pub struct IdmListener {
+/// Accepts capsudo connections arriving over the fake IDM channel.
+pub struct FakeIdmListener {
     inner: TcpListener,
 }
 
-impl IdmListener {
-    /// Binds the IDM endpoint at `addr`.
-    pub async fn bind(addr: impl ToSocketAddrs) -> Result<IdmListener> {
+impl FakeIdmListener {
+    /// Binds the fake IDM endpoint at `addr`.
+    pub async fn bind(addr: impl ToSocketAddrs) -> Result<FakeIdmListener> {
         let inner = TcpListener::bind(addr).await?;
-        Ok(IdmListener { inner })
+        Ok(FakeIdmListener { inner })
     }
 
     /// The bound local address (useful when binding to an ephemeral port).
@@ -53,7 +50,7 @@ impl IdmListener {
 }
 
 #[async_trait]
-impl Listener for IdmListener {
+impl Listener for FakeIdmListener {
     async fn accept(&mut self) -> Result<Box<dyn Transport>> {
         let (stream, _peer) = self.inner.accept().await?;
         stream.set_nodelay(true)?;

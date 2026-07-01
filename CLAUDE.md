@@ -8,13 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build
 cargo test
 cargo clippy --all-targets
-cargo build --features capsudo-transport/idm   # build the cross-zone IDM stub
+cargo build --features capsudo-transport/fakeidm   # build the fake IDM stub
 ```
 
 - Async throughout, on tokio. Edition 2021, license `0BSD`.
-- The IDM transport lives behind the `idm` feature of `capsudo-transport`. Tests
-  for it are in `capsudo-core` (its dev-dependency enables the feature), so a
-  plain `cargo test` already covers the cross-zone path — no `--features` needed.
+- The fake IDM transport lives behind the `fakeidm` feature of
+  `capsudo-transport`. Tests for it are in `capsudo-core` (its dev-dependency
+  enables the feature), so a plain `cargo test` already covers the cross-zone
+  path — no `--features` needed.
 - Linux-only: relies on `SCM_RIGHTS`, `SO_PEERCRED`/`SO_PEERSEC`, ptys, and
   `/proc/self/attr/exec`.
 
@@ -60,9 +61,11 @@ trait alone and never change between local and cross-zone.
   stream and pumps the fd's bytes inside the channel; the receiver fabricates a
   socket pair, hands one end out as if it arrived over `SCM_RIGHTS`, and bridges
   the other end to the stream. Neither peer can tell.
-- `idm` (feature-gated) — a stand-in for an Edera IDM channel built on
-  `MuxTransport` over TCP. Swapping in a real IDM channel is just replacing the
-  byte-channel constructor; everything above is unchanged.
+- `fakeidm` (feature-gated) — a throwaway stand-in for an Edera IDM channel
+  built on `MuxTransport` over TCP, for exercising the cross-zone path on one
+  host. The real integration lives in Protect's zone agent; swapping it in is
+  just replacing the byte-channel constructor, since everything above is
+  unchanged.
 
 `FdSpec`/`FdDir` tag each delegated fd with a direction. The unix transport
 ignores it; the mux transport needs it (it must not, e.g., *read* a write-only

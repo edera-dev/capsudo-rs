@@ -44,7 +44,7 @@ Two things in the original assume a shared kernel:
 | Crate | Role |
 |-------|------|
 | `capsudo-proto` | Transport-agnostic wire protocol: message types, portable fixed-endianness framing. No I/O. |
-| `capsudo-transport` | `Transport`/`Listener` traits + implementations: `unix` (real `SCM_RIGHTS`), `mux` (simulated fd-passing over any byte channel), `idm` (cross-zone stub, feature `idm`). |
+| `capsudo-transport` | `Transport`/`Listener` traits + implementations: `unix` (real `SCM_RIGHTS`), `mux` (simulated fd-passing over any byte channel), `fakeidm` (throwaway TCP cross-zone stub, feature `fakeidm`). |
 | `capsudo-core` | Client and daemon session logic, written entirely against the traits. |
 | `capsudo` | Client binary. |
 | `capsudod` | Daemon binary (listening, or one-shot on stdin). |
@@ -55,7 +55,7 @@ Two things in the original assume a shared kernel:
 ```
 cargo build
 cargo test
-cargo build --features capsudo-transport/idm    # include the IDM stub
+cargo build --features capsudo-transport/fakeidm    # include the fake IDM stub
 ```
 
 ## Command-line
