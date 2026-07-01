@@ -4,6 +4,10 @@
 [config]
 reduce_output = false
 skip_core_tasks = true
+# This is a virtual workspace; run each task once at the root (our tasks already
+# use --workspace) rather than letting cargo-make fan them out per member, where
+# root-only tasks like assemble-release-assets don't exist.
+default_to_workspace = false
 
 #
 # Environment and Profile Setup
