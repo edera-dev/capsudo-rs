@@ -21,6 +21,31 @@ protocol and the same client/daemon logic run unchanged over a local Unix
 socket *or* a cross-zone IDM channel, so a capability held in one Edera zone can
 be exposed to another without either side knowing the difference.
 
+## What this enables
+
+The motivating deployment is autonomous AI agents. An agent is sandboxed
+precisely because what it runs cannot be fully trusted, yet real work needs a
+few privileged operations: push this image, run that deploy script, restart a
+wedged service. The conventional escapes all grant ambient, stealable
+authority. A kubeconfig or SSH key mounted into the sandbox works from
+anywhere once exfiltrated, and sudo inside the sandbox puts privilege in the
+one place most likely to be prompt-injected.
+
+capsudo restates the problem in object-capability terms. The agent's zone
+holds no credentials at all; it holds an endpoint, and reaching the endpoint
+is the permission. The daemon side fixes the command and environment (`-f`,
+`-E`), so even a fully compromised client can only cause the pre-approved
+operation to run. There is nothing to steal: the endpoint does not exist
+outside the zone it was granted to, and its effect cannot be broadened from
+the client side.
+
+For the caller nothing changes: prefix a command, keep ordinary
+stdin/stdout/stderr, exit codes, and fully interactive ptys, whether the
+daemon is local or in another zone. In an Edera Protect deployment the grants
+are declarative: the zone agent launches and manages the attenuated `capsudod`
+instances from configuration and proxies an endpoint like `/run/cap/<name>`
+into each authorized zone over IDM.
+
 ## Why a rewrite was needed for cross-zone
 
 Two things in the original assume a shared kernel:
@@ -48,7 +73,7 @@ Two things in the original assume a shared kernel:
 | `capsudo-core` | Client and daemon session logic, written entirely against the traits. |
 | `capsudo` | Client binary. |
 | `capsudod` | Daemon binary (listening, or one-shot on stdin). |
-| `capsudod-pwauth` | Authenticating front-end: shadow-password check, then chain to `capsudod`. |
+| `capsudod-pwauth` | Authenticating front-end: shadow-password check, then chain to `capsudod`. Local sockets only: it identifies the caller via `SO_PEERCRED`, which does not exist across zones. |
 
 ## Build & test
 
