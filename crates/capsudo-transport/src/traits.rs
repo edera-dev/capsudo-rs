@@ -71,12 +71,18 @@ pub struct FdSpec<'a> {
 impl<'a> FdSpec<'a> {
     /// A read-only descriptor (e.g. stdin).
     pub fn read(fd: BorrowedFd<'a>) -> FdSpec<'a> {
-        FdSpec { fd, dir: FdDir::Read }
+        FdSpec {
+            fd,
+            dir: FdDir::Read,
+        }
     }
 
     /// A write-only descriptor (e.g. stdout/stderr).
     pub fn write(fd: BorrowedFd<'a>) -> FdSpec<'a> {
-        FdSpec { fd, dir: FdDir::Write }
+        FdSpec {
+            fd,
+            dir: FdDir::Write,
+        }
     }
 
     /// A bidirectional descriptor (e.g. a pty).

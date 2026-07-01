@@ -200,7 +200,10 @@ pub struct Message {
 impl Message {
     /// Builds a message from a type tag and raw payload.
     pub fn new(field_type: FieldType, payload: Vec<u8>) -> Message {
-        Message { field_type, payload }
+        Message {
+            field_type,
+            payload,
+        }
     }
 
     /// The message's type tag.
@@ -305,23 +308,27 @@ impl Message {
 
     /// Interprets the payload as a little-endian `i32` (e.g. an exit code).
     pub fn as_i32(&self) -> Result<i32, ProtoError> {
-        let bytes: [u8; 4] = self.payload.as_slice().try_into().map_err(|_| {
-            ProtoError::InvalidPayload {
-                field_type: self.field_type,
-                reason: "expected 4-byte integer",
-            }
-        })?;
+        let bytes: [u8; 4] =
+            self.payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProtoError::InvalidPayload {
+                    field_type: self.field_type,
+                    reason: "expected 4-byte integer",
+                })?;
         Ok(i32::from_le_bytes(bytes))
     }
 
     /// Interprets the payload as a little-endian `u32` (e.g. an fd count).
     pub fn as_u32(&self) -> Result<u32, ProtoError> {
-        let bytes: [u8; 4] = self.payload.as_slice().try_into().map_err(|_| {
-            ProtoError::InvalidPayload {
-                field_type: self.field_type,
-                reason: "expected 4-byte integer",
-            }
-        })?;
+        let bytes: [u8; 4] =
+            self.payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProtoError::InvalidPayload {
+                    field_type: self.field_type,
+                    reason: "expected 4-byte integer",
+                })?;
         Ok(u32::from_le_bytes(bytes))
     }
 

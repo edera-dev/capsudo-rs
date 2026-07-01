@@ -60,7 +60,10 @@ mod tests {
 
     #[test]
     fn numeric_owner_spec() {
-        assert_eq!(parse_owner_spec("1000:1000"), Some((Some(1000), Some(1000))));
+        assert_eq!(
+            parse_owner_spec("1000:1000"),
+            Some((Some(1000), Some(1000)))
+        );
         assert_eq!(parse_owner_spec("1000"), Some((Some(1000), None)));
         assert_eq!(parse_owner_spec(":1000"), Some((None, Some(1000))));
     }

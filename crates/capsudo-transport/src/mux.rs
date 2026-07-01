@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use capsudo_proto::{Header, Message};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{Result, TransportError};
@@ -463,7 +463,9 @@ fn dup_owned(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    let flags = OFlag::from_bits_truncate(fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?);
+    let flags = OFlag::from_bits_truncate(
+        fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?,
+    );
     fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
     Ok(())
 }
@@ -506,7 +508,10 @@ fn decode_message(buf: &[u8]) -> Option<Message> {
     if buf.len() != Header::SIZE + header.len as usize {
         return None;
     }
-    Some(Message::new(header.field_type, buf[Header::SIZE..].to_vec()))
+    Some(Message::new(
+        header.field_type,
+        buf[Header::SIZE..].to_vec(),
+    ))
 }
 
 async fn write_frame<W>(writer: &mut W, kind: u8, stream_id: u32, payload: &[u8]) -> io::Result<()>

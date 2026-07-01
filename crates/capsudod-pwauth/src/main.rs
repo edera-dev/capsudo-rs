@@ -34,9 +34,7 @@ struct Options {
 }
 
 fn usage() -> ! {
-    eprintln!(
-        "usage: capsudod-pwauth -S socket [-o user[:group]] [-m mode] -- capsudod [args...]"
-    );
+    eprintln!("usage: capsudod-pwauth -S socket [-o user[:group]] [-m mode] -- capsudod [args...]");
     std::process::exit(2);
 }
 

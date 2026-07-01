@@ -156,7 +156,11 @@ impl Bridge {
 
         // client input -> master (cancellable)
         let t_in = std::thread::spawn(move || {
-            relay(client_in.as_raw_fd(), master_for_write.as_raw_fd(), Some(cancel_r.as_raw_fd()));
+            relay(
+                client_in.as_raw_fd(),
+                master_for_write.as_raw_fd(),
+                Some(cancel_r.as_raw_fd()),
+            );
             // keep fds owned until the thread ends
             drop((client_in, master_for_write, cancel_r));
         });

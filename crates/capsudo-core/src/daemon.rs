@@ -132,7 +132,9 @@ async fn receive_configuration(
         argv.push("sh".to_owned());
     }
 
-    let stdio = stdio.ok_or(CoreError::Protocol("client did not delegate stdio descriptors"))?;
+    let stdio = stdio.ok_or(CoreError::Protocol(
+        "client did not delegate stdio descriptors",
+    ))?;
 
     Ok(SessionRequest {
         argv,
@@ -186,7 +188,11 @@ async fn run_and_report(transport: &mut dyn Transport, request: SessionRequest) 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let _ = send_error(transport, &format!("unable to run {}: {e}", request.argv[0])).await;
+            let _ = send_error(
+                transport,
+                &format!("unable to run {}: {e}", request.argv[0]),
+            )
+            .await;
             return send_exit(transport, 127).await;
         }
     };
