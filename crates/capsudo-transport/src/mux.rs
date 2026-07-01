@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -339,7 +339,7 @@ fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>)
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; PUMP_BUF];
         loop {
-            match nix::unistd::read(fd.as_raw_fd(), &mut buf) {
+            match nix::unistd::read(&fd, &mut buf) {
                 Ok(0) => {
                     let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
                     break;
@@ -398,8 +398,7 @@ async fn async_reader(fd: Arc<AsyncFd<OwnedFd>>, id: u32, frame_tx: mpsc::Sender
             Ok(guard) => guard,
             Err(_) => break,
         };
-        let raw = fd.get_ref().as_raw_fd();
-        match guard.try_io(|_| nix::unistd::read(raw, &mut buf).map_err(io::Error::from)) {
+        match guard.try_io(|_| nix::unistd::read(fd.get_ref(), &mut buf).map_err(io::Error::from)) {
             Ok(Ok(0)) => {
                 let _ = frame_tx.send(OutFrame::StreamClose(id)).await;
                 break;
@@ -457,16 +456,13 @@ async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<Str
 use std::os::fd::AsFd;
 
 fn dup_owned(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
-    let raw = nix::unistd::dup(fd.as_raw_fd()).map_err(io::Error::from)?;
-    // SAFETY: dup returned a fresh, owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    let owned = nix::unistd::dup(fd).map_err(io::Error::from)?;
+    Ok(owned)
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    let flags = OFlag::from_bits_truncate(
-        fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?,
-    );
-    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
     Ok(())
 }
 

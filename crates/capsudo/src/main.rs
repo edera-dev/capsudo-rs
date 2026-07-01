@@ -111,8 +111,8 @@ fn append_default_env(env: &mut Vec<String>) {
 /// Picks a session type when the user did not force one: interactive if both
 /// stdin and stdout are terminals.
 fn determine_session_type() -> SessionType {
-    let stdin_tty = nix::unistd::isatty(std::io::stdin().as_raw_fd()).unwrap_or(false);
-    let stdout_tty = nix::unistd::isatty(std::io::stdout().as_raw_fd()).unwrap_or(false);
+    let stdin_tty = nix::unistd::isatty(std::io::stdin()).unwrap_or(false);
+    let stdout_tty = nix::unistd::isatty(std::io::stdout()).unwrap_or(false);
     if stdin_tty && stdout_tty {
         SessionType::Interactive
     } else {

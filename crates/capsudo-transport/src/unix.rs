@@ -210,8 +210,7 @@ impl Transport for UnixTransport {
         // A dup writes to the same socket independently of the receiving path.
         // Safe here because the only post-handshake writes are winsize updates;
         // the main task only reads.
-        let dup = nix::unistd::dup(self.stream.as_raw_fd()).ok()?;
-        let fd = unsafe { OwnedFd::from_raw_fd(dup) };
+        let fd = nix::unistd::dup(&self.stream).ok()?;
         Some(Box::new(UnixControlSender { fd: Arc::new(fd) }))
     }
 }
