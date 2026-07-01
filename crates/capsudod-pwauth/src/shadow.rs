@@ -6,6 +6,10 @@
 
 use std::ffi::{CStr, CString};
 
+// glibc moved crypt(3) into libxcrypt, which is not linked automatically, so it
+// must be requested explicitly (mirroring the C build's `-lcrypt`). musl bundles
+// crypt in libc, so no extra library is linked there.
+#[cfg_attr(target_env = "gnu", link(name = "crypt"))]
 extern "C" {
     fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
 }
