@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use capsudo_proto::{Header, Message};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+use nix::unistd::pipe;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -89,6 +91,17 @@ pub struct MuxTransport {
     ctrl_rx: mpsc::Receiver<CtrlItem>,
     streams: StreamMap,
     next_id: u32,
+    /// Read/write ends of a pipe used to cancel the blocking sender-side
+    /// readers. Each reader `poll`s a dup of the read end; dropping the write
+    /// end (when this transport is dropped) fires POLLHUP so every reader wakes
+    /// and exits *without* consuming a byte from the descriptor it was pumping.
+    /// This matters for a delegated descriptor that outlives the session (e.g.
+    /// the caller's tty): a plain blocking `read` would otherwise sit in the
+    /// syscall and steal the next byte (a keystroke) when it finally returned.
+    cancel_read: OwnedFd,
+    // Held only for its Drop: closing it fires POLLHUP on the readers' `poll`.
+    #[allow(dead_code)]
+    cancel_write: OwnedFd,
 }
 
 impl MuxTransport {
@@ -102,6 +115,7 @@ impl MuxTransport {
         let (frame_tx, frame_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(CHANNEL_DEPTH);
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let (cancel_read, cancel_write) = pipe().expect("failed to create mux cancel pipe");
 
         tokio::spawn(writer_task(writer, frame_rx));
         tokio::spawn(reader_task(
@@ -121,6 +135,8 @@ impl MuxTransport {
             ctrl_rx,
             streams,
             next_id,
+            cancel_read,
+            cancel_write,
         }
     }
 
@@ -148,7 +164,8 @@ impl MuxTransport {
         if spec.dir.reads() {
             // We will read this descriptor and forward it as stream data.
             let dup = dup_owned(spec.fd)?;
-            spawn_blocking_reader(dup, id, self.frame_tx.clone());
+            let cancel = dup_owned(self.cancel_read.as_fd())?;
+            spawn_blocking_reader(dup, id, self.frame_tx.clone(), cancel);
         }
         Ok(())
     }
@@ -335,28 +352,65 @@ fn materialize_stream(
 // session, then it exits), so a pump still blocked in read() at exit is reaped
 // with the process.
 
-fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>) {
+fn spawn_blocking_reader(
+    fd: OwnedFd,
+    id: u32,
+    frame_tx: mpsc::Sender<OutFrame>,
+    cancel: OwnedFd,
+) {
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; PUMP_BUF];
         loop {
-            match nix::unistd::read(&fd, &mut buf) {
-                Ok(0) => {
-                    let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
-                    break;
-                }
-                Ok(n) => {
-                    if frame_tx
-                        .blocking_send(OutFrame::StreamData(id, buf[..n].to_vec()))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+            // Wait for the descriptor to be readable OR for the cancel pipe to
+            // signal (its write end was dropped with the transport). Checking
+            // cancel *before* reading is what stops us from consuming a byte
+            // from a descriptor that outlives the session, e.g. stealing the
+            // caller's next keystroke off a shared tty.
+            let mut poll_fds = [
+                PollFd::new(fd.as_fd(), PollFlags::POLLIN),
+                PollFd::new(cancel.as_fd(), PollFlags::POLLIN),
+            ];
+            match poll(&mut poll_fds, PollTimeout::NONE) {
+                Ok(_) => {}
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(_) => {
                     let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
                     break;
                 }
+            }
+
+            // Cancelled (POLLHUP/POLLIN on the pipe): stop without reading `fd`.
+            if poll_fds[1].revents().is_some_and(|revents| !revents.is_empty()) {
+                break;
+            }
+
+            let Some(revents) = poll_fds[0].revents() else {
+                continue;
+            };
+            if revents.intersects(PollFlags::POLLIN) {
+                // `poll` reported data, so this read returns promptly.
+                match nix::unistd::read(&fd, &mut buf) {
+                    Ok(0) => {
+                        let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
+                        break;
+                    }
+                    Ok(n) => {
+                        if frame_tx
+                            .blocking_send(OutFrame::StreamData(id, buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(_) => {
+                        let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
+                        break;
+                    }
+                }
+            } else if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+                let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
+                break;
             }
         }
     });

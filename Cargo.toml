@@ -22,7 +22,7 @@ repository = "https://github.com/edera-dev/capsudo-rs"
 thiserror = "2"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
-nix = { version = "0.31", features = ["socket", "uio", "term", "process", "fs", "user", "hostname"] }
+nix = { version = "0.31", features = ["socket", "uio", "term", "process", "fs", "user", "hostname", "poll"] }
 libc = "0.2"
 capsudo-proto = { path = "crates/capsudo-proto", version = "0.1.1" }
 capsudo-transport = { path = "crates/capsudo-transport", version = "0.1.1" }
