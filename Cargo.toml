@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "0BSD"
 authors = ["Edera, Inc."]
@@ -24,6 +24,6 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process", "signal"] }
 nix = { version = "0.31", features = ["socket", "uio", "term", "process", "fs", "user", "hostname", "poll"] }
 libc = "0.2"
-capsudo-proto = { path = "crates/capsudo-proto", version = "0.1.1" }
-capsudo-transport = { path = "crates/capsudo-transport", version = "0.1.1" }
-capsudo-core = { path = "crates/capsudo-core", version = "0.1.1" }
+capsudo-proto = { path = "crates/capsudo-proto", version = "0.1.2" }
+capsudo-transport = { path = "crates/capsudo-transport", version = "0.1.2" }
+capsudo-core = { path = "crates/capsudo-core", version = "0.1.2" }
