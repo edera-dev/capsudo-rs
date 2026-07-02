@@ -352,12 +352,7 @@ fn materialize_stream(
 // session, then it exits), so a pump still blocked in read() at exit is reaped
 // with the process.
 
-fn spawn_blocking_reader(
-    fd: OwnedFd,
-    id: u32,
-    frame_tx: mpsc::Sender<OutFrame>,
-    cancel: OwnedFd,
-) {
+fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>, cancel: OwnedFd) {
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; PUMP_BUF];
         loop {
@@ -380,7 +375,10 @@ fn spawn_blocking_reader(
             }
 
             // Cancelled (POLLHUP/POLLIN on the pipe): stop without reading `fd`.
-            if poll_fds[1].revents().is_some_and(|revents| !revents.is_empty()) {
+            if poll_fds[1]
+                .revents()
+                .is_some_and(|revents| !revents.is_empty())
+            {
                 break;
             }
 
