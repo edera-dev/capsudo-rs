@@ -172,6 +172,12 @@ async fn main() -> ExitCode {
             Ok(SessionOutcome::Exited(code)) => {
                 return ExitCode::from((code & 0xff) as u8);
             }
+            // The library hands the daemon's explanation back rather than
+            // printing it, so telling the user is this binary's job.
+            Ok(SessionOutcome::Failed { code, message }) => {
+                eprintln!("capsudo: error: {message}");
+                return ExitCode::from((code & 0xff) as u8);
+            }
             Ok(SessionOutcome::Unauthorized(prompt)) => {
                 if secret.is_some() {
                     eprintln!("capsudo: authentication failed");

@@ -116,6 +116,10 @@ messages (window-size updates) concurrently with a parked `recv()`.
   open file description, so `O_NONBLOCK` comes with it. `EAGAIN` therefore means
   "wait and retry", never "give up" — treating it as fatal silently truncated a
   stream as soon as a peer outran the far end.
+- The client never prints. A daemon's `Error` message is carried back as
+  `SessionOutcome::Failed`, because an embedder (Protect's daemon) needs to log
+  and attribute it, not have it appear on the process's stderr. Printing it is
+  the `capsudo` binary's job.
 - SELinux/`SO_PEERSEC` and a successful pwauth login can only be exercised on an
   SELinux host / with root + a real password; the rest is covered by `cargo test`
   and the binaries' smoke paths.

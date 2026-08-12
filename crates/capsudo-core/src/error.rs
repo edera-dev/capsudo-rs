@@ -24,6 +24,10 @@ pub enum CoreError {
     /// The peer sent something that violates the protocol contract.
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
+
+    /// The daemon refused to run the program, in its own words.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Convenience result alias for core operations.
