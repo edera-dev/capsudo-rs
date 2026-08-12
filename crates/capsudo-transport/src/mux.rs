@@ -401,6 +401,14 @@ fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>,
                         }
                     }
                     Err(nix::errno::Errno::EINTR) => continue,
+                    // The descriptor may be non-blocking: a caller can hand us
+                    // one it also drives with an async runtime, and `dup` shares
+                    // the open file description, so `O_NONBLOCK` comes with it.
+                    // A readiness report is not a guarantee — the data can be
+                    // gone by the time we read, e.g. consumed by another reader
+                    // of the same description. Wait again rather than treating
+                    // it as end of stream.
+                    Err(nix::errno::Errno::EAGAIN) => continue,
                     Err(_) => {
                         let _ = frame_tx.blocking_send(OutFrame::StreamClose(id));
                         break;
@@ -429,16 +437,47 @@ fn spawn_blocking_writer(fd: OwnedFd, mut inbound: mpsc::Receiver<StreamMsg>) {
     });
 }
 
+/// Writes every byte to `fd`, whether or not the descriptor is blocking.
+///
+/// A caller may hand us a descriptor it also drives with an async runtime, and
+/// `dup` shares the open file description, so `O_NONBLOCK` comes along with it.
+/// Treating the resulting `EAGAIN` as fatal would silently truncate a stream the
+/// first time a peer wrote faster than the far end read — so wait for writability
+/// and carry on, which is what a blocking descriptor would have done for us.
 fn write_all_blocking(fd: &OwnedFd, mut bytes: &[u8]) -> nix::Result<()> {
     while !bytes.is_empty() {
         match nix::unistd::write(fd.as_fd(), bytes) {
             Ok(0) => return Err(nix::errno::Errno::EIO),
             Ok(n) => bytes = &bytes[n..],
             Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => wait_writable(fd)?,
             Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Blocks until `fd` can accept more bytes, or the peer has gone.
+fn wait_writable(fd: &OwnedFd) -> nix::Result<()> {
+    loop {
+        let mut poll_fds = [PollFd::new(fd.as_fd(), PollFlags::POLLOUT)];
+        match poll(&mut poll_fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+        let Some(revents) = poll_fds[0].revents() else {
+            continue;
+        };
+        // A hangup means nobody will ever read what is left; report it rather
+        // than waiting forever on a descriptor that will never drain.
+        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            return Err(nix::errno::Errno::EPIPE);
+        }
+        if revents.intersects(PollFlags::POLLOUT) {
+            return Ok(());
+        }
+    }
 }
 
 // ---- receiver-side pumps (async, used on socket pairs we create) ------------

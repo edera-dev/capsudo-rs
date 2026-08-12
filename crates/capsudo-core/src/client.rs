@@ -37,6 +37,11 @@ pub struct ClientRequest {
 pub enum SessionOutcome {
     /// The program ran and exited with this status.
     Exited(i32),
+    /// The daemon reported why it would not run the program, and the session
+    /// ended with `code`. Kept distinct from [`SessionOutcome::Exited`] so a
+    /// caller can tell "the program ran and failed" from "the program never
+    /// ran", and can put the daemon's own words somewhere useful.
+    Failed { code: i32, message: String },
     /// The daemon (or an authenticating front-end) requires a secret; the
     /// payload is the prompt to show the user. The caller should obtain a
     /// secret, reconnect, and retry with it.
@@ -53,6 +58,9 @@ pub async fn run_client(
 ) -> Result<i32> {
     match run_session(transport, request, stdio, None).await? {
         SessionOutcome::Exited(code) => Ok(code),
+        // There is no exit status to report: the program never ran, and the
+        // daemon said why.
+        SessionOutcome::Failed { message, .. } => Err(CoreError::Refused(message)),
         SessionOutcome::Unauthorized(_) => Err(CoreError::Protocol("authentication required")),
     }
 }
@@ -100,27 +108,45 @@ pub async fn run_session(
 }
 
 /// Waits for the daemon's terminal message (exit, or an auth challenge).
+///
+/// An `Error` is not itself terminal — the daemon sends it and then an `Exit` —
+/// so it is carried until the exit arrives and returned with it. This is a
+/// library: writing the daemon's message to the process's stderr would put it
+/// somewhere an embedder cannot capture, redirect, or attribute, and lose it
+/// for the caller entirely.
 async fn await_outcome(transport: &mut dyn Transport) -> Result<SessionOutcome> {
+    let mut failure: Option<String> = None;
     loop {
         let Some(received) = transport.recv().await? else {
             return Err(CoreError::DaemonClosed);
         };
 
         match received.message.field_type() {
-            FieldType::Exit => return Ok(SessionOutcome::Exited(received.message.as_i32()?)),
+            FieldType::Exit => {
+                let code = received.message.as_i32()?;
+                return Ok(match failure {
+                    Some(message) => SessionOutcome::Failed { code, message },
+                    None => SessionOutcome::Exited(code),
+                });
+            }
             FieldType::Unauthorized => {
                 let prompt = received.message.as_str().unwrap_or("password: ").to_owned();
                 return Ok(SessionOutcome::Unauthorized(prompt));
             }
             FieldType::Error => {
-                eprintln!(
-                    "capsudo: error: {}",
-                    received.message.as_str().unwrap_or("<malformed error>")
-                );
+                // Keep the first: it is the one that describes why the session
+                // failed, and anything after it is likely a consequence.
+                failure.get_or_insert_with(|| {
+                    received
+                        .message
+                        .as_str()
+                        .unwrap_or("<malformed error>")
+                        .to_owned()
+                });
             }
-            other => {
-                eprintln!("capsudo: ignoring unexpected message {other:?}");
-            }
+            // Nothing else is meaningful here, and a peer is free to send
+            // messages this version does not know about.
+            _ => {}
         }
     }
 }
