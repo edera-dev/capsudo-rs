@@ -111,6 +111,11 @@ messages (window-size updates) concurrently with a parked `recv()`.
 - Sender-side mux pumps use blocking threads (caller fds may be regular files or
   ttys, which epoll can't watch); receiver-side pumps are async on the socket
   pairs the transport creates. This asymmetry is intentional — see `mux.rs`.
+  The blocking pumps still handle a *non-blocking* descriptor: a caller may
+  delegate a socket it also drives with an async runtime, and `dup` shares the
+  open file description, so `O_NONBLOCK` comes with it. `EAGAIN` therefore means
+  "wait and retry", never "give up" — treating it as fatal silently truncated a
+  stream as soon as a peer outran the far end.
 - SELinux/`SO_PEERSEC` and a successful pwauth login can only be exercised on an
   SELinux host / with root + a real password; the rest is covered by `cargo test`
   and the binaries' smoke paths.
