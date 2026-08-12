@@ -33,7 +33,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "capsudo"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "capsudo-core",
  "capsudo-proto",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "capsudo-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "capsudo-proto",
  "capsudo-transport",
@@ -56,14 +56,14 @@ dependencies = [
 
 [[package]]
 name = "capsudo-proto"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "capsudo-transport"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "capsudo-proto",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "capsudod"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "capsudo-core",
  "capsudo-transport",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "capsudod-pwauth"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "capsudo-proto",
  "capsudo-transport",
