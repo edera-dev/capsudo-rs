@@ -102,6 +102,13 @@ pub struct MuxTransport {
     // Held only for its Drop: closing it fires POLLHUP on the readers' `poll`.
     #[allow(dead_code)]
     cancel_write: OwnedFd,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for MuxTransport {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl MuxTransport {
@@ -118,12 +125,13 @@ impl MuxTransport {
         let (cancel_read, cancel_write) = pipe().expect("failed to create mux cancel pipe");
 
         tokio::spawn(writer_task(writer, frame_rx));
-        tokio::spawn(reader_task(
+        let reader = tokio::spawn(reader_task(
             reader,
             ctrl_tx,
             streams.clone(),
             frame_tx.clone(),
-        ));
+        ))
+        .abort_handle();
 
         let next_id = match side {
             Side::Dialer => 0,
@@ -137,6 +145,7 @@ impl MuxTransport {
             next_id,
             cancel_read,
             cancel_write,
+            reader,
         }
     }
 
@@ -252,9 +261,10 @@ where
             OutFrame::StreamClose(id) => write_frame(&mut writer, KIND_STREAM_CLOSE, id, &[]).await,
         };
         if result.is_err() {
-            break;
+            return;
         }
     }
+    let _ = writer.shutdown().await;
 }
 
 /// Reads frames off the channel, routing stream traffic to per-stream pumps and
