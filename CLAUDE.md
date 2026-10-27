@@ -95,6 +95,13 @@ messages (window-size updates) concurrently with a parked `recv()`.
   queue the `Fds` frame *before* starting pumps, or stream data races ahead of
   the frame that tells the peer how to route it (this was a real bug; the
   ordering is load-bearing).
+- **Mux flow control** lives in `mux.rs` (`Flow`, `Credit`, `StreamSink`).
+  Each stream has a credit window that the receiver returns with `Window`
+  frames, so a stream nobody reads cannot stall the reader. Only a peer that
+  sent `Hello` is held to grants, so old peers still interoperate. `send` is a
+  barrier: it waits until every socket-backed stream has framed what was unread
+  when it began. Without it, an `Exit` overtakes credit-blocked output and the
+  caller loses the tail of it (this was a real bug).
 - **Daemon-side pty** spans `pty.rs` (pty alloc, child session-leader setup via
   `pre_exec`, the master↔client bridge threads) and `client.rs` + the `capsudo`
   binary (raw mode, `SIGWINCH` → `Winsize` over `ControlSender`). The bridge's
