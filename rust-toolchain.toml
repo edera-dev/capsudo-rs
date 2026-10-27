@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.89.0"
+channel = "1.95.0"
 components = ["rustfmt", "rust-std", "clippy"]
 # Declared here (not only via `rustup target add` in the Makefile) because that
 # command ignores this toolchain override and would add the target to the
