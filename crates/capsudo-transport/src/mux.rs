@@ -21,6 +21,12 @@
 //! The channel underneath is any `AsyncRead + AsyncWrite`: a TCP socket, an
 //! in-process duplex pipe, or an Edera IDM ring. See [`fakeidm`](crate::fakeidm)
 //! for a throwaway TCP-backed stand-in used in tests.
+//!
+//! Every stream is flow-controlled with a credit window, so a stream whose far
+//! end stops reading never stops the reader from delivering control messages or
+//! the other streams. Each end opens with a `Hello` frame, and only a peer that
+//! sent one is held to its grants, so an end that predates windowing still
+//! interoperates.
 
 use std::collections::HashMap;
 use std::io;
@@ -45,16 +51,31 @@ const KIND_CONTROL: u8 = 1;
 const KIND_FDS: u8 = 2;
 const KIND_STREAM_DATA: u8 = 3;
 const KIND_STREAM_CLOSE: u8 = 4;
+const KIND_HELLO: u8 = 5;
+const KIND_WINDOW: u8 = 6;
 
 const MUX_HEADER: usize = 9;
 const PUMP_BUF: usize = 16 * 1024;
 const CHANNEL_DEPTH: usize = 64;
 
-/// How many bytes one stream may queue before the reader waits for its pump.
-/// Bytes are counted as frame header plus payload, so a stream of tiny frames is
-/// bounded too. A stream frame larger than this ends the session, so a sender
-/// may raise its frame size up to this without breaking an older receiver.
-const STREAM_QUEUE_LIMIT: usize = 1024 * 1024;
+/// The flow-control version this end speaks, carried in its `Hello` frame.
+const WINDOW_VERSION: u32 = 1;
+
+/// How many bytes a sender may have in flight on one stream before it waits for
+/// a grant. Bytes are counted as frame header plus payload, so a stream of tiny
+/// frames is bounded too.
+const STREAM_WINDOW: usize = 1024 * 1024;
+
+/// How much a receiver consumes before it grants it back, unless its queue runs
+/// empty first.
+const GRANT_BATCH: usize = STREAM_WINDOW / 4;
+
+/// How many bytes one stream may queue before the reader waits for its pump. A
+/// windowed sender overshoots its window by at most one frame, so only a peer
+/// without windowing ever makes the reader wait. A stream frame larger than this
+/// ends the session, so a sender may raise its frame size up to this without
+/// breaking an older receiver.
+const STREAM_QUEUE_LIMIT: usize = STREAM_WINDOW + MUX_HEADER + PUMP_BUF;
 
 /// The largest frame payload, which is one whole encoded control message.
 const MAX_FRAME_PAYLOAD: usize = Header::SIZE + MAX_PAYLOAD;
@@ -76,10 +97,13 @@ pub enum Side {
 
 /// A frame queued for the writer task.
 enum OutFrame {
+    Hello,
     Control(Vec<u8>),
     Fds(Vec<u8>),
     StreamData(u32, Vec<u8>),
     StreamClose(u32),
+    /// The receiver consumed this many bytes of the stream and can take more.
+    Window(u32, u32),
 }
 
 /// A message handed up to [`MuxTransport::recv`].
@@ -115,17 +139,24 @@ struct QueueDepth {
 
 type StreamMap = Arc<Mutex<HashMap<u32, Arc<Inbound>>>>;
 
-/// How far each stream that reads a socket the mux made has got, so a message
-/// can wait behind the output written before it.
+/// How far each stream this end writes into the channel has got, what it may
+/// still send, and what the peer said about windowing.
 #[derive(Default)]
 struct Flow {
+    peer_windowed: AtomicBool,
+    closed: AtomicBool,
     progress: Mutex<HashMap<u32, Arc<Progress>>>,
 }
 
-/// How much of one stream's socket its pump has read and framed.
+/// How much of one stream its pump has read and framed, and how much the peer
+/// says it may still send.
 struct Progress {
-    /// Our end of the socket pair the stream reads.
-    socket: Arc<AsyncFd<OwnedFd>>,
+    /// Credit in bytes. It goes negative by up to one frame, because a sender
+    /// waits only for credit to be positive.
+    available: Mutex<i64>,
+    granted: Notify,
+    /// Our end of the socket pair the stream reads, when the mux made it.
+    socket: Option<Arc<AsyncFd<OwnedFd>>>,
     /// Bytes read out of `socket`. The pump reads under this lock, so a barrier
     /// sees what was read and what is still unread at one moment.
     taken: Mutex<u64>,
@@ -136,8 +167,10 @@ struct Progress {
 }
 
 impl Flow {
-    fn open(self: &Arc<Self>, id: u32, socket: Arc<AsyncFd<OwnedFd>>) -> Outbound {
+    fn open(self: &Arc<Self>, id: u32, socket: Option<Arc<AsyncFd<OwnedFd>>>) -> Outbound {
         let progress = Arc::new(Progress {
+            available: Mutex::new(STREAM_WINDOW as i64),
+            granted: Notify::new(),
             socket,
             taken: Mutex::new(0),
             sent: AtomicU64::new(0),
@@ -152,23 +185,48 @@ impl Flow {
         }
     }
 
+    fn grant(&self, id: u32, bytes: u32) {
+        let progress = self.progress.lock().unwrap().get(&id).cloned();
+        if let Some(progress) = progress {
+            *progress.available.lock().unwrap() += i64::from(bytes);
+            progress.granted.notify_waiters();
+        }
+    }
+
+    /// Releases every sender waiting for credit, because no grant will come.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        for progress in self.progress.lock().unwrap().values() {
+            progress.granted.notify_waiters();
+            progress.progressed.notify_waiters();
+        }
+    }
+
     /// Waits until every stream that reads a socket the mux made has queued what
     /// was unread in that socket when the barrier began. A frame queued after the
     /// barrier then follows the bytes written before it, as it would if the
     /// descriptor had really been passed. Only that backlog counts, so a holder
     /// that keeps writing cannot hold the barrier open.
     async fn barrier(&self) {
-        let streams: Vec<Arc<Progress>> = self.progress.lock().unwrap().values().cloned().collect();
+        let streams: Vec<Arc<Progress>> = self
+            .progress
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|progress| progress.socket.is_some())
+            .cloned()
+            .collect();
         for stream in streams {
             let target = {
                 let taken = stream.taken.lock().unwrap();
-                *taken + unread(&stream.socket)
+                *taken + stream.socket.as_deref().map_or(0, unread)
             };
             loop {
                 let progressed = stream.progressed.notified();
                 tokio::pin!(progressed);
                 progressed.as_mut().enable();
-                if stream.done.load(Ordering::Acquire)
+                if self.closed.load(Ordering::Acquire)
+                    || stream.done.load(Ordering::Acquire)
                     || stream.sent.load(Ordering::Acquire) >= target
                 {
                     break;
@@ -179,7 +237,7 @@ impl Flow {
     }
 }
 
-/// A pump's hold on a stream it reads out of a socket the mux made.
+/// A pump's hold on a stream it reads into the channel.
 struct Outbound {
     flow: Arc<Flow>,
     id: u32,
@@ -187,6 +245,30 @@ struct Outbound {
 }
 
 impl Outbound {
+    /// Waits until the stream may send, or returns false once the transport is
+    /// gone. A peer that never said `Hello` gives no grants, so it is not waited on.
+    async fn ready(&self) -> bool {
+        loop {
+            let granted = self.progress.granted.notified();
+            tokio::pin!(granted);
+            granted.as_mut().enable();
+            if self.flow.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            if !self.flow.peer_windowed.load(Ordering::Acquire)
+                || *self.progress.available.lock().unwrap() > 0
+            {
+                return true;
+            }
+            granted.await;
+        }
+    }
+
+    /// Charges a frame carrying `payload` bytes against the window.
+    fn debit(&self, payload: usize) {
+        *self.progress.available.lock().unwrap() -= (MUX_HEADER + payload) as i64;
+    }
+
     /// Reads from the stream's socket, counting what it takes for a barrier.
     fn read(&self, fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
         let mut taken = self.progress.taken.lock().unwrap();
@@ -229,10 +311,16 @@ struct StreamSink {
     id: u32,
     depth: Arc<QueueDepth>,
     streams: Weak<Mutex<HashMap<u32, Arc<Inbound>>>>,
+    flow: Arc<Flow>,
+    ungranted: usize,
 }
 
 impl StreamSink {
-    fn open(streams: &StreamMap, id: u32) -> (StreamSink, mpsc::UnboundedReceiver<StreamMsg>) {
+    fn open(
+        streams: &StreamMap,
+        flow: &Arc<Flow>,
+        id: u32,
+    ) -> (StreamSink, mpsc::UnboundedReceiver<StreamMsg>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let depth = Arc::new(QueueDepth {
             queued: AtomicUsize::new(0),
@@ -250,16 +338,40 @@ impl StreamSink {
             id,
             depth,
             streams: Arc::downgrade(streams),
+            flow: flow.clone(),
+            ungranted: 0,
         };
         (sink, rx)
     }
 
-    /// Records that the pump wrote out a frame carrying `payload` bytes.
-    fn consumed(&self, payload: usize) {
-        self.depth
-            .queued
-            .fetch_sub(MUX_HEADER + payload, Ordering::AcqRel);
+    /// Records that the pump wrote out a frame carrying `payload` bytes, and
+    /// returns a grant when one is due. `idle` says the queue is now empty, so a
+    /// sender waiting on the remainder of its window is not left waiting.
+    fn consumed(&mut self, payload: usize, idle: bool) -> Option<OutFrame> {
+        let cost = MUX_HEADER + payload;
+        self.depth.queued.fetch_sub(cost, Ordering::AcqRel);
         self.depth.drained.notify_waiters();
+        if !self.flow.peer_windowed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.ungranted += cost;
+        if self.ungranted < GRANT_BATCH && !idle {
+            return None;
+        }
+        let grant = OutFrame::Window(self.id, self.ungranted as u32);
+        self.ungranted = 0;
+        Some(grant)
+    }
+
+    /// Unregisters a stream whose pump stops before the peer closes it, and
+    /// returns a grant of a whole window. The sender may have spent its window on
+    /// data the pump will never write, and the reader grants only what arrives
+    /// after the stream is gone.
+    fn abandon(self) -> Option<OutFrame> {
+        let grant = OutFrame::Window(self.id, STREAM_WINDOW as u32);
+        let windowed = self.flow.peer_windowed.load(Ordering::Acquire);
+        drop(self);
+        windowed.then_some(grant)
     }
 }
 
@@ -321,6 +433,7 @@ pub struct MuxTransport {
 impl Drop for MuxTransport {
     fn drop(&mut self) {
         self.reader.abort();
+        self.flow.close();
     }
 }
 
@@ -338,6 +451,10 @@ impl MuxTransport {
         let flow = Arc::new(Flow::default());
         let (cancel_read, cancel_write) = pipe().expect("failed to create mux cancel pipe");
 
+        // The peer reads `Hello` before any stream data, so it knows to grant.
+        frame_tx
+            .try_send(OutFrame::Hello)
+            .expect("a new frame queue has room");
         tokio::spawn(writer_task(writer, frame_rx));
         let reader = tokio::spawn(reader_task(
             reader,
@@ -381,15 +498,15 @@ impl MuxTransport {
     fn start_sender_pumps(&mut self, id: u32, spec: &FdSpec<'_>) -> Result<()> {
         if spec.dir.writes() {
             // We will write inbound stream data to this descriptor.
-            let (sink, rx) = StreamSink::open(&self.streams, id);
+            let (sink, rx) = StreamSink::open(&self.streams, &self.flow, id);
             let dup = dup_owned(spec.fd)?;
-            spawn_blocking_writer(dup, rx, sink);
+            spawn_blocking_writer(dup, rx, sink, self.frame_tx.clone());
         }
         if spec.dir.reads() {
             // We will read this descriptor and forward it as stream data.
             let dup = dup_owned(spec.fd)?;
             let cancel = dup_owned(self.cancel_read.as_fd())?;
-            spawn_blocking_reader(dup, id, self.frame_tx.clone(), cancel);
+            spawn_blocking_reader(dup, self.flow.open(id, None), self.frame_tx.clone(), cancel);
         }
         Ok(())
     }
@@ -472,12 +589,18 @@ where
 {
     while let Some(frame) = frame_rx.recv().await {
         let result = match frame {
+            OutFrame::Hello => {
+                write_frame(&mut writer, KIND_HELLO, 0, &WINDOW_VERSION.to_le_bytes()).await
+            }
             OutFrame::Control(buf) => write_frame(&mut writer, KIND_CONTROL, 0, &buf).await,
             OutFrame::Fds(buf) => write_frame(&mut writer, KIND_FDS, 0, &buf).await,
             OutFrame::StreamData(id, buf) => {
                 write_frame(&mut writer, KIND_STREAM_DATA, id, &buf).await
             }
             OutFrame::StreamClose(id) => write_frame(&mut writer, KIND_STREAM_CLOSE, id, &[]).await,
+            OutFrame::Window(id, bytes) => {
+                write_frame(&mut writer, KIND_WINDOW, id, &bytes.to_le_bytes()).await
+            }
         };
         if result.is_err() {
             return;
@@ -498,7 +621,7 @@ async fn reader_task<R>(
     R: AsyncRead + Unpin,
 {
     let live = Arc::new(AtomicUsize::new(0));
-    loop {
+    'frames: loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
             Ok(None) | Err(_) => break,
@@ -530,7 +653,7 @@ async fn reader_task<R>(
                         sender_dir.invert(),
                     ) {
                         Ok(fd) => local_ends.push(fd),
-                        Err(_) => return,
+                        Err(_) => break 'frames,
                     }
                 }
                 if ctrl_tx.send(CtrlItem::Fds(local_ends)).await.is_err() {
@@ -543,10 +666,17 @@ async fn reader_task<R>(
                     break;
                 }
                 let inbound = streams.lock().unwrap().get(&id).cloned();
-                if let Some(inbound) = inbound {
-                    wait_for_room(&inbound, cost).await;
-                    inbound.depth.queued.fetch_add(cost, Ordering::AcqRel);
-                    let _ = inbound.tx.send(StreamMsg::Data(payload));
+                let delivered = match inbound {
+                    Some(inbound) => {
+                        wait_for_room(&inbound, cost).await;
+                        inbound.depth.queued.fetch_add(cost, Ordering::AcqRel);
+                        inbound.tx.send(StreamMsg::Data(payload)).is_ok()
+                    }
+                    None => false,
+                };
+                // The sender still waits for credit for data whose pump is gone.
+                if !delivered && flow.peer_windowed.load(Ordering::Acquire) {
+                    let _ = frame_tx.send(OutFrame::Window(id, cost as u32)).await;
                 }
             }
             KIND_STREAM_CLOSE => {
@@ -555,10 +685,24 @@ async fn reader_task<R>(
                     let _ = inbound.tx.send(StreamMsg::Close);
                 }
             }
+            KIND_HELLO => {
+                // A later version may add fields after the version, so only
+                // the first four bytes are read.
+                let version = payload.get(..4).and_then(decode_u32);
+                if version.is_some_and(|version| version >= WINDOW_VERSION) {
+                    flow.peer_windowed.store(true, Ordering::Release);
+                }
+            }
+            KIND_WINDOW => {
+                if let Some(bytes) = decode_u32(&payload) {
+                    flow.grant(id, bytes);
+                }
+            }
             _ => {}
         }
     }
     // Dropping ctrl_tx here makes recv() observe a clean end-of-stream.
+    flow.close();
 }
 
 /// Waits until a stream's queue has room for `cost` more bytes, or its pump is
@@ -604,11 +748,12 @@ fn materialize_stream(
     // sharing the socket stops too.
     let hangup = Arc::new(Notify::new());
     if dir.writes() {
-        let (sink, rx) = StreamSink::open(streams, id);
+        let (sink, rx) = StreamSink::open(streams, flow, id);
         tokio::spawn(async_writer(
             ours.clone(),
             rx,
             sink,
+            frame_tx.clone(),
             hangup.clone(),
             !dir.reads(),
             slot.clone(),
@@ -617,7 +762,7 @@ fn materialize_stream(
     if dir.reads() {
         tokio::spawn(async_reader(
             ours.clone(),
-            flow.open(id, ours.clone()),
+            flow.open(id, Some(ours.clone())),
             frame_tx.clone(),
             hangup,
             slot,
@@ -634,10 +779,22 @@ fn materialize_stream(
 // session, then it exits), so a pump still blocked in read() at exit is reaped
 // with the process.
 
-fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>, cancel: OwnedFd) {
+fn spawn_blocking_reader(
+    fd: OwnedFd,
+    outbound: Outbound,
+    frame_tx: mpsc::Sender<OutFrame>,
+    cancel: OwnedFd,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    let id = outbound.id;
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; PUMP_BUF];
         loop {
+            // Waiting before the read leaves the bytes in a descriptor that
+            // outlives the session, e.g. a keystroke on the caller's tty.
+            if !runtime.block_on(outbound.ready()) {
+                break;
+            }
             // Wait for the descriptor to be readable OR for the cancel pipe to
             // signal (its write end was dropped with the transport). Checking
             // cancel *before* reading is what stops us from consuming a byte
@@ -675,6 +832,7 @@ fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>,
                         break;
                     }
                     Ok(n) => {
+                        outbound.debit(n);
                         if frame_tx
                             .blocking_send(OutFrame::StreamData(id, buf[..n].to_vec()))
                             .is_err()
@@ -707,16 +865,24 @@ fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>,
 fn spawn_blocking_writer(
     fd: OwnedFd,
     mut inbound: mpsc::UnboundedReceiver<StreamMsg>,
-    sink: StreamSink,
+    mut sink: StreamSink,
+    frame_tx: mpsc::Sender<OutFrame>,
 ) {
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = inbound.blocking_recv() {
             match msg {
                 StreamMsg::Data(bytes) => {
                     if write_all_blocking(&fd, &bytes).is_err() {
-                        break;
+                        if let Some(grant) = sink.abandon() {
+                            let _ = frame_tx.blocking_send(grant);
+                        }
+                        return;
                     }
-                    sink.consumed(bytes.len());
+                    // A grant that cannot be sent must not stop delivery of
+                    // what the peer already sent.
+                    if let Some(grant) = sink.consumed(bytes.len(), inbound.is_empty()) {
+                        let _ = frame_tx.blocking_send(grant);
+                    }
                 }
                 StreamMsg::Close => break, // dropping fd closes it, signalling EOF
             }
@@ -779,6 +945,9 @@ async fn async_reader(
     let id = outbound.id;
     let mut buf = [0u8; PUMP_BUF];
     loop {
+        if !outbound.ready().await {
+            break;
+        }
         let mut guard = match fd.readable().await {
             Ok(guard) => guard,
             Err(_) => break,
@@ -794,6 +963,7 @@ async fn async_reader(
                 break;
             }
             Ok(Ok(n)) => {
+                outbound.debit(n);
                 if frame_tx
                     .send(OutFrame::StreamData(id, buf[..n].to_vec()))
                     .await
@@ -816,16 +986,17 @@ async fn async_reader(
 async fn async_writer(
     fd: Arc<AsyncFd<OwnedFd>>,
     mut inbound: mpsc::UnboundedReceiver<StreamMsg>,
-    sink: StreamSink,
+    mut sink: StreamSink,
+    frame_tx: mpsc::Sender<OutFrame>,
     hangup: Arc<Notify>,
     watch_close: bool,
     _slot: Arc<StreamSlot>,
 ) {
-    loop {
+    'pump: loop {
         let msg = tokio::select! {
             msg = inbound.recv() => msg,
-            () = hangup.notified() => return,
-            () = closed_by_holder(&fd), if watch_close => return,
+            () = hangup.notified() => break 'pump,
+            () = closed_by_holder(&fd), if watch_close => break 'pump,
         };
         let Some(msg) = msg else { return };
         match msg {
@@ -834,17 +1005,19 @@ async fn async_writer(
                 while offset < bytes.len() {
                     let mut guard = match fd.writable().await {
                         Ok(guard) => guard,
-                        Err(_) => return,
+                        Err(_) => break 'pump,
                     };
                     match guard.try_io(|_| {
                         nix::unistd::write(fd.get_ref(), &bytes[offset..]).map_err(io::Error::from)
                     }) {
                         Ok(Ok(n)) => offset += n,
-                        Ok(Err(_)) => return,
+                        Ok(Err(_)) => break 'pump,
                         Err(_would_block) => continue,
                     }
                 }
-                sink.consumed(bytes.len());
+                if let Some(grant) = sink.consumed(bytes.len(), inbound.is_empty()) {
+                    let _ = frame_tx.send(grant).await;
+                }
             }
             StreamMsg::Close => {
                 // Tell the peer (e.g. the child) it has reached EOF.
@@ -852,9 +1025,12 @@ async fn async_writer(
                     fd.get_ref().as_raw_fd(),
                     nix::sys::socket::Shutdown::Write,
                 );
-                break;
+                return;
             }
         }
+    }
+    if let Some(grant) = sink.abandon() {
+        let _ = frame_tx.send(grant).await;
     }
 }
 
@@ -934,6 +1110,10 @@ fn unread(fd: &AsyncFd<OwnedFd>) -> u64 {
     } else {
         unread as u64
     }
+}
+
+fn decode_u32(buf: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(buf.try_into().ok()?))
 }
 
 fn decode_message(buf: &[u8]) -> Option<Message> {
