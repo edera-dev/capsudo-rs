@@ -25,17 +25,18 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
-use capsudo_proto::{Header, Message};
+use capsudo_proto::{Header, Message, MAX_PAYLOAD};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use nix::unistd::pipe;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::error::{Result, TransportError};
 use crate::traits::{ControlSender, FdDir, FdSpec, Received, Transport};
@@ -48,6 +49,20 @@ const KIND_STREAM_CLOSE: u8 = 4;
 const MUX_HEADER: usize = 9;
 const PUMP_BUF: usize = 16 * 1024;
 const CHANNEL_DEPTH: usize = 64;
+
+/// How many bytes one stream may queue before the reader waits for its pump.
+/// Bytes are counted as frame header plus payload, so a stream of tiny frames is
+/// bounded too. A stream frame larger than this ends the session, so a sender
+/// may raise its frame size up to this without breaking an older receiver.
+const STREAM_QUEUE_LIMIT: usize = 1024 * 1024;
+
+/// The largest frame payload, which is one whole encoded control message.
+const MAX_FRAME_PAYLOAD: usize = Header::SIZE + MAX_PAYLOAD;
+
+/// The most streams the peer may have delegated to this end at once. Each holds
+/// a socket pair from the moment its frame arrives, before anything can refuse
+/// it, and a capsudo session delegates three.
+const MAX_LIVE_STREAMS: usize = 8;
 
 /// Which half of a connection an endpoint is, used to partition the stream-id
 /// space so the two ends never allocate colliding ids.
@@ -82,7 +97,204 @@ enum StreamMsg {
     Close,
 }
 
-type StreamMap = Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>>;
+/// The receiving end of one stream: its pump's queue, and how much is in it.
+struct Inbound {
+    tx: mpsc::UnboundedSender<StreamMsg>,
+    depth: Arc<QueueDepth>,
+}
+
+/// How many bytes wait in a stream's queue. Kept apart from the queue's sender,
+/// which the pump must never hold, or its queue would never close.
+struct QueueDepth {
+    queued: AtomicUsize,
+    drained: Notify,
+    /// Set when the pump stops, so a reader waiting for room in its queue stops
+    /// waiting.
+    closed: AtomicBool,
+}
+
+type StreamMap = Arc<Mutex<HashMap<u32, Arc<Inbound>>>>;
+
+/// How far each stream that reads a socket the mux made has got, so a message
+/// can wait behind the output written before it.
+#[derive(Default)]
+struct Flow {
+    progress: Mutex<HashMap<u32, Arc<Progress>>>,
+}
+
+/// How much of one stream's socket its pump has read and framed.
+struct Progress {
+    /// Our end of the socket pair the stream reads.
+    socket: Arc<AsyncFd<OwnedFd>>,
+    /// Bytes read out of `socket`. The pump reads under this lock, so a barrier
+    /// sees what was read and what is still unread at one moment.
+    taken: Mutex<u64>,
+    /// Bytes whose frames are queued.
+    sent: AtomicU64,
+    progressed: Notify,
+    done: AtomicBool,
+}
+
+impl Flow {
+    fn open(self: &Arc<Self>, id: u32, socket: Arc<AsyncFd<OwnedFd>>) -> Outbound {
+        let progress = Arc::new(Progress {
+            socket,
+            taken: Mutex::new(0),
+            sent: AtomicU64::new(0),
+            progressed: Notify::new(),
+            done: AtomicBool::new(false),
+        });
+        self.progress.lock().unwrap().insert(id, progress.clone());
+        Outbound {
+            flow: self.clone(),
+            id,
+            progress,
+        }
+    }
+
+    /// Waits until every stream that reads a socket the mux made has queued what
+    /// was unread in that socket when the barrier began. A frame queued after the
+    /// barrier then follows the bytes written before it, as it would if the
+    /// descriptor had really been passed. Only that backlog counts, so a holder
+    /// that keeps writing cannot hold the barrier open.
+    async fn barrier(&self) {
+        let streams: Vec<Arc<Progress>> = self.progress.lock().unwrap().values().cloned().collect();
+        for stream in streams {
+            let target = {
+                let taken = stream.taken.lock().unwrap();
+                *taken + unread(&stream.socket)
+            };
+            loop {
+                let progressed = stream.progressed.notified();
+                tokio::pin!(progressed);
+                progressed.as_mut().enable();
+                if stream.done.load(Ordering::Acquire)
+                    || stream.sent.load(Ordering::Acquire) >= target
+                {
+                    break;
+                }
+                progressed.await;
+            }
+        }
+    }
+}
+
+/// A pump's hold on a stream it reads out of a socket the mux made.
+struct Outbound {
+    flow: Arc<Flow>,
+    id: u32,
+    progress: Arc<Progress>,
+}
+
+impl Outbound {
+    /// Reads from the stream's socket, counting what it takes for a barrier.
+    fn read(&self, fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
+        let mut taken = self.progress.taken.lock().unwrap();
+        let read = nix::unistd::read(fd, buf).map_err(io::Error::from)?;
+        *taken += read as u64;
+        Ok(read)
+    }
+
+    /// Records that a frame carrying `payload` bytes is queued.
+    fn queued(&self, payload: usize) {
+        self.progress
+            .sent
+            .fetch_add(payload as u64, Ordering::AcqRel);
+        self.progress.progressed.notify_waiters();
+    }
+}
+
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        let mut streams = self.flow.progress.lock().unwrap();
+        // The peer picks the ids of the streams it delegates, so another
+        // stream may hold this id by now.
+        if streams
+            .get(&self.id)
+            .is_some_and(|progress| Arc::ptr_eq(progress, &self.progress))
+        {
+            streams.remove(&self.id);
+        }
+        drop(streams);
+        self.progress.done.store(true, Ordering::Release);
+        self.progress.progressed.notify_waiters();
+    }
+}
+
+/// A pump's hold on a stream it writes out of the channel. Dropping it
+/// unregisters the stream, so later data for it is discarded. The map is weak
+/// because it owns the pump's queue, and the pump must see that queue close
+/// when the transport goes.
+struct StreamSink {
+    id: u32,
+    depth: Arc<QueueDepth>,
+    streams: Weak<Mutex<HashMap<u32, Arc<Inbound>>>>,
+}
+
+impl StreamSink {
+    fn open(streams: &StreamMap, id: u32) -> (StreamSink, mpsc::UnboundedReceiver<StreamMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let depth = Arc::new(QueueDepth {
+            queued: AtomicUsize::new(0),
+            drained: Notify::new(),
+            closed: AtomicBool::new(false),
+        });
+        streams.lock().unwrap().insert(
+            id,
+            Arc::new(Inbound {
+                tx,
+                depth: depth.clone(),
+            }),
+        );
+        let sink = StreamSink {
+            id,
+            depth,
+            streams: Arc::downgrade(streams),
+        };
+        (sink, rx)
+    }
+
+    /// Records that the pump wrote out a frame carrying `payload` bytes.
+    fn consumed(&self, payload: usize) {
+        self.depth
+            .queued
+            .fetch_sub(MUX_HEADER + payload, Ordering::AcqRel);
+        self.depth.drained.notify_waiters();
+    }
+}
+
+impl Drop for StreamSink {
+    fn drop(&mut self) {
+        if let Some(streams) = self.streams.upgrade() {
+            let mut streams = streams.lock().unwrap();
+            if streams
+                .get(&self.id)
+                .is_some_and(|inbound| Arc::ptr_eq(&inbound.depth, &self.depth))
+            {
+                streams.remove(&self.id);
+            }
+        }
+        self.depth.closed.store(true, Ordering::Release);
+        self.depth.drained.notify_waiters();
+    }
+}
+
+/// One delegated stream's place in the count of live streams. Its pumps share
+/// it, so the place is freed when the last of them stops.
+struct StreamSlot(Arc<AtomicUsize>);
+
+impl StreamSlot {
+    fn take(live: &Arc<AtomicUsize>) -> Arc<StreamSlot> {
+        live.fetch_add(1, Ordering::AcqRel);
+        Arc::new(StreamSlot(live.clone()))
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A [`Transport`] over an arbitrary byte channel, with descriptor passing
 /// emulated by stream multiplexing.
@@ -103,6 +315,7 @@ pub struct MuxTransport {
     #[allow(dead_code)]
     cancel_write: OwnedFd,
     reader: tokio::task::AbortHandle,
+    flow: Arc<Flow>,
 }
 
 impl Drop for MuxTransport {
@@ -122,6 +335,7 @@ impl MuxTransport {
         let (frame_tx, frame_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(CHANNEL_DEPTH);
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let flow = Arc::new(Flow::default());
         let (cancel_read, cancel_write) = pipe().expect("failed to create mux cancel pipe");
 
         tokio::spawn(writer_task(writer, frame_rx));
@@ -130,6 +344,7 @@ impl MuxTransport {
             ctrl_tx,
             streams.clone(),
             frame_tx.clone(),
+            flow.clone(),
         ))
         .abort_handle();
 
@@ -146,6 +361,7 @@ impl MuxTransport {
             cancel_read,
             cancel_write,
             reader,
+            flow,
         }
     }
 
@@ -165,10 +381,9 @@ impl MuxTransport {
     fn start_sender_pumps(&mut self, id: u32, spec: &FdSpec<'_>) -> Result<()> {
         if spec.dir.writes() {
             // We will write inbound stream data to this descriptor.
-            let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
-            self.streams.lock().unwrap().insert(id, tx);
+            let (sink, rx) = StreamSink::open(&self.streams, id);
             let dup = dup_owned(spec.fd)?;
-            spawn_blocking_writer(dup, rx);
+            spawn_blocking_writer(dup, rx, sink);
         }
         if spec.dir.reads() {
             // We will read this descriptor and forward it as stream data.
@@ -183,6 +398,7 @@ impl MuxTransport {
 #[async_trait]
 impl Transport for MuxTransport {
     async fn send(&mut self, msg: &Message, fds: &[FdSpec<'_>]) -> Result<()> {
+        self.flow.barrier().await;
         if fds.is_empty() {
             return self
                 .frame_tx
@@ -226,6 +442,7 @@ impl Transport for MuxTransport {
     fn control_sender(&self) -> Option<Box<dyn ControlSender>> {
         Some(Box::new(MuxControlSender {
             frame_tx: self.frame_tx.clone(),
+            flow: self.flow.clone(),
         }))
     }
 }
@@ -234,11 +451,13 @@ impl Transport for MuxTransport {
 /// with all other frames by the single writer task.
 struct MuxControlSender {
     frame_tx: mpsc::Sender<OutFrame>,
+    flow: Arc<Flow>,
 }
 
 #[async_trait]
 impl ControlSender for MuxControlSender {
     async fn send_control(&self, msg: Message) -> Result<()> {
+        self.flow.barrier().await;
         self.frame_tx
             .send(OutFrame::Control(msg.encode()))
             .await
@@ -274,9 +493,11 @@ async fn reader_task<R>(
     ctrl_tx: mpsc::Sender<CtrlItem>,
     streams: StreamMap,
     frame_tx: mpsc::Sender<OutFrame>,
+    flow: Arc<Flow>,
 ) where
     R: AsyncRead + Unpin,
 {
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -293,11 +514,21 @@ async fn reader_task<R>(
                 }
             }
             KIND_FDS => {
+                if live.load(Ordering::Acquire) + payload.len() / 5 > MAX_LIVE_STREAMS {
+                    break;
+                }
                 // Materialize local ends here, before reading the next frame, so
                 // stream data that follows always finds its pump registered.
                 let mut local_ends = Vec::new();
                 for (stream_id, sender_dir) in decode_fds(&payload) {
-                    match materialize_stream(&streams, &frame_tx, stream_id, sender_dir.invert()) {
+                    match materialize_stream(
+                        &streams,
+                        &frame_tx,
+                        &flow,
+                        StreamSlot::take(&live),
+                        stream_id,
+                        sender_dir.invert(),
+                    ) {
                         Ok(fd) => local_ends.push(fd),
                         Err(_) => return,
                     }
@@ -307,15 +538,21 @@ async fn reader_task<R>(
                 }
             }
             KIND_STREAM_DATA => {
-                let sender = streams.lock().unwrap().get(&id).cloned();
-                if let Some(sender) = sender {
-                    let _ = sender.send(StreamMsg::Data(payload)).await;
+                let cost = MUX_HEADER + payload.len();
+                if cost > STREAM_QUEUE_LIMIT {
+                    break;
+                }
+                let inbound = streams.lock().unwrap().get(&id).cloned();
+                if let Some(inbound) = inbound {
+                    wait_for_room(&inbound, cost).await;
+                    inbound.depth.queued.fetch_add(cost, Ordering::AcqRel);
+                    let _ = inbound.tx.send(StreamMsg::Data(payload));
                 }
             }
             KIND_STREAM_CLOSE => {
-                let sender = streams.lock().unwrap().remove(&id);
-                if let Some(sender) = sender {
-                    let _ = sender.send(StreamMsg::Close).await;
+                let inbound = streams.lock().unwrap().remove(&id);
+                if let Some(inbound) = inbound {
+                    let _ = inbound.tx.send(StreamMsg::Close);
                 }
             }
             _ => {}
@@ -324,11 +561,31 @@ async fn reader_task<R>(
     // Dropping ctrl_tx here makes recv() observe a clean end-of-stream.
 }
 
+/// Waits until a stream's queue has room for `cost` more bytes, or its pump is
+/// gone. An empty queue always has room, so one large frame cannot wait forever.
+async fn wait_for_room(inbound: &Inbound, cost: usize) {
+    loop {
+        let drained = inbound.depth.drained.notified();
+        tokio::pin!(drained);
+        drained.as_mut().enable();
+        let queued = inbound.depth.queued.load(Ordering::Acquire);
+        if queued == 0
+            || queued + cost <= STREAM_QUEUE_LIMIT
+            || inbound.depth.closed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        drained.await;
+    }
+}
+
 /// Fabricates a socket pair for a received stream, registers/spawns the pumps
 /// that bridge our end to the channel, and returns the other end to hand out.
 fn materialize_stream(
     streams: &StreamMap,
     frame_tx: &mpsc::Sender<OutFrame>,
+    flow: &Arc<Flow>,
+    slot: Arc<StreamSlot>,
     id: u32,
     dir: FdDir,
 ) -> Result<OwnedFd> {
@@ -343,13 +600,28 @@ fn materialize_stream(
     set_nonblocking(&ours)?;
     let ours = Arc::new(AsyncFd::new(ours)?);
 
+    // Set by the reader when the holder closes the end we hand out, so a writer
+    // sharing the socket stops too.
+    let hangup = Arc::new(Notify::new());
     if dir.writes() {
-        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
-        streams.lock().unwrap().insert(id, tx);
-        tokio::spawn(async_writer(ours.clone(), rx));
+        let (sink, rx) = StreamSink::open(streams, id);
+        tokio::spawn(async_writer(
+            ours.clone(),
+            rx,
+            sink,
+            hangup.clone(),
+            !dir.reads(),
+            slot.clone(),
+        ));
     }
     if dir.reads() {
-        tokio::spawn(async_reader(ours.clone(), id, frame_tx.clone()));
+        tokio::spawn(async_reader(
+            ours.clone(),
+            flow.open(id, ours.clone()),
+            frame_tx.clone(),
+            hangup,
+            slot,
+        ));
     }
 
     Ok(theirs)
@@ -432,7 +704,11 @@ fn spawn_blocking_reader(fd: OwnedFd, id: u32, frame_tx: mpsc::Sender<OutFrame>,
     });
 }
 
-fn spawn_blocking_writer(fd: OwnedFd, mut inbound: mpsc::Receiver<StreamMsg>) {
+fn spawn_blocking_writer(
+    fd: OwnedFd,
+    mut inbound: mpsc::UnboundedReceiver<StreamMsg>,
+    sink: StreamSink,
+) {
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = inbound.blocking_recv() {
             match msg {
@@ -440,6 +716,7 @@ fn spawn_blocking_writer(fd: OwnedFd, mut inbound: mpsc::Receiver<StreamMsg>) {
                     if write_all_blocking(&fd, &bytes).is_err() {
                         break;
                     }
+                    sink.consumed(bytes.len());
                 }
                 StreamMsg::Close => break, // dropping fd closes it, signalling EOF
             }
@@ -492,15 +769,27 @@ fn wait_writable(fd: &OwnedFd) -> nix::Result<()> {
 
 // ---- receiver-side pumps (async, used on socket pairs we create) ------------
 
-async fn async_reader(fd: Arc<AsyncFd<OwnedFd>>, id: u32, frame_tx: mpsc::Sender<OutFrame>) {
+async fn async_reader(
+    fd: Arc<AsyncFd<OwnedFd>>,
+    outbound: Outbound,
+    frame_tx: mpsc::Sender<OutFrame>,
+    hangup: Arc<Notify>,
+    _slot: Arc<StreamSlot>,
+) {
+    let id = outbound.id;
     let mut buf = [0u8; PUMP_BUF];
     loop {
         let mut guard = match fd.readable().await {
             Ok(guard) => guard,
             Err(_) => break,
         };
-        match guard.try_io(|_| nix::unistd::read(fd.get_ref(), &mut buf).map_err(io::Error::from)) {
+        match guard.try_io(|_| outbound.read(fd.get_ref(), &mut buf)) {
             Ok(Ok(0)) => {
+                // End of file is also a half-close, after which the holder still
+                // reads. Only a full close ends the writer.
+                if hung_up(fd.get_ref()) {
+                    hangup.notify_one();
+                }
                 let _ = frame_tx.send(OutFrame::StreamClose(id)).await;
                 break;
             }
@@ -512,6 +801,7 @@ async fn async_reader(fd: Arc<AsyncFd<OwnedFd>>, id: u32, frame_tx: mpsc::Sender
                 {
                     break;
                 }
+                outbound.queued(n);
             }
             Ok(Err(_)) => break,
             Err(_would_block) => continue,
@@ -519,8 +809,25 @@ async fn async_reader(fd: Arc<AsyncFd<OwnedFd>>, id: u32, frame_tx: mpsc::Sender
     }
 }
 
-async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<StreamMsg>) {
-    while let Some(msg) = inbound.recv().await {
+/// Writes a stream's inbound data to our end of its socket pair. It stops when
+/// the holder of the other end closes it, so a stream nobody holds frees its
+/// socket. `watch_close` is set when no reader pump shares the socket to notice
+/// the close instead.
+async fn async_writer(
+    fd: Arc<AsyncFd<OwnedFd>>,
+    mut inbound: mpsc::UnboundedReceiver<StreamMsg>,
+    sink: StreamSink,
+    hangup: Arc<Notify>,
+    watch_close: bool,
+    _slot: Arc<StreamSlot>,
+) {
+    loop {
+        let msg = tokio::select! {
+            msg = inbound.recv() => msg,
+            () = hangup.notified() => return,
+            () = closed_by_holder(&fd), if watch_close => return,
+        };
+        let Some(msg) = msg else { return };
         match msg {
             StreamMsg::Data(bytes) => {
                 let mut offset = 0;
@@ -537,6 +844,7 @@ async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<Str
                         Err(_would_block) => continue,
                     }
                 }
+                sink.consumed(bytes.len());
             }
             StreamMsg::Close => {
                 // Tell the peer (e.g. the child) it has reached EOF.
@@ -548,6 +856,31 @@ async fn async_writer(fd: Arc<AsyncFd<OwnedFd>>, mut inbound: mpsc::Receiver<Str
             }
         }
     }
+}
+
+/// Resolves once the holder of the far end of a socket we only write to closes
+/// it. Nothing reads what the holder writes into that end, so it is discarded.
+async fn closed_by_holder(fd: &AsyncFd<OwnedFd>) {
+    let mut buf = [0u8; 512];
+    loop {
+        let Ok(mut guard) = fd.readable().await else {
+            return;
+        };
+        match guard.try_io(|_| nix::unistd::read(fd.get_ref(), &mut buf).map_err(io::Error::from)) {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(_)) | Err(_) => {}
+        }
+    }
+}
+
+/// Whether both directions of a socket are shut, which for a socket pair means
+/// the other end was closed rather than half-closed.
+fn hung_up(fd: &OwnedFd) -> bool {
+    let mut poll_fds = [PollFd::new(fd.as_fd(), PollFlags::empty())];
+    poll(&mut poll_fds, PollTimeout::ZERO).is_ok()
+        && poll_fds[0]
+            .revents()
+            .is_some_and(|revents| revents.contains(PollFlags::POLLHUP))
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -589,6 +922,18 @@ fn decode_fds(buf: &[u8]) -> Vec<(u32, FdDir)> {
             Some((id, dir))
         })
         .collect()
+}
+
+/// How many bytes wait unread in a socket.
+fn unread(fd: &AsyncFd<OwnedFd>) -> u64 {
+    let mut unread: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int through the pointer, which is valid for it.
+    let result = unsafe { libc::ioctl(fd.get_ref().as_raw_fd(), libc::FIONREAD, &mut unread) };
+    if result < 0 {
+        0
+    } else {
+        unread as u64
+    }
 }
 
 fn decode_message(buf: &[u8]) -> Option<Message> {
@@ -636,6 +981,12 @@ where
     let kind = header[0];
     let stream_id = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
     let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    if len > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mux frame too large",
+        ));
+    }
 
     let mut payload = vec![0u8; len];
     if len > 0 {
