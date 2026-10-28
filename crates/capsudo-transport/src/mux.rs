@@ -24,14 +24,16 @@
 //!
 //! Every stream is flow-controlled with a credit window, so a stream whose far
 //! end stops reading never stops the reader from delivering control messages or
-//! the other streams. Each end opens with a `Hello` frame, and only a peer that
+//! the other streams. Each end opens with a `Hello` frame that advertises the
+//! window it grants and the largest stream frame it takes, and only a peer that
 //! sent one is held to its grants, so an end that predates windowing still
 //! interoperates.
 
 use std::collections::HashMap;
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -62,20 +64,23 @@ const CHANNEL_DEPTH: usize = 64;
 const WINDOW_VERSION: u32 = 1;
 
 /// How many bytes a sender may have in flight on one stream before it waits for
-/// a grant. Bytes are counted as frame header plus payload, so a stream of tiny
-/// frames is bounded too.
-const STREAM_WINDOW: usize = 1024 * 1024;
+/// a grant, unless the receiver advertises another window. Bytes are counted as
+/// frame header plus payload, so a stream of tiny frames is bounded too.
+const STREAM_WINDOW: u32 = 1024 * 1024;
 
-/// How much a receiver consumes before it grants it back, unless its queue runs
-/// empty first.
-const GRANT_BATCH: usize = STREAM_WINDOW / 4;
+/// The largest window this end may grant. Its queue limit is the window plus one
+/// frame, and `Hello` carries that limit as a `u32`.
+const MAX_WINDOW: u32 = u32::MAX - (MUX_HEADER + PUMP_BUF) as u32;
 
-/// How many bytes one stream may queue before the reader waits for its pump. A
-/// windowed sender overshoots its window by at most one frame, so only a peer
-/// without windowing ever makes the reader wait. A stream frame larger than this
-/// ends the session, so a sender may raise its frame size up to this without
-/// breaking an older receiver.
-const STREAM_QUEUE_LIMIT: usize = STREAM_WINDOW + MUX_HEADER + PUMP_BUF;
+/// The largest stream frame a sender sends before it sees the peer's `Hello`,
+/// as header plus payload, so the smallest a peer may ask for. A sender may
+/// raise its frames up to what the peer asks for, never below this.
+const MIN_STREAM_FRAME: usize = MUX_HEADER + PUMP_BUF;
+
+/// The most streams that may owe the peer credit for discarded data at once.
+/// The peer names the stream of each frame, so each new id it names would
+/// otherwise cost an entry.
+const MAX_OWED_STREAMS: usize = 64;
 
 /// The largest frame payload, which is one whole encoded control message.
 const MAX_FRAME_PAYLOAD: usize = Header::SIZE + MAX_PAYLOAD;
@@ -97,7 +102,6 @@ pub enum Side {
 
 /// A frame queued for the writer task.
 enum OutFrame {
-    Hello,
     Control(Vec<u8>),
     Fds(Vec<u8>),
     StreamData(u32, Vec<u8>),
@@ -140,12 +144,20 @@ struct QueueDepth {
 type StreamMap = Arc<Mutex<HashMap<u32, Arc<Inbound>>>>;
 
 /// How far each stream this end writes into the channel has got, what it may
-/// still send, and what the peer said about windowing.
-#[derive(Default)]
+/// still send, and what each end said about windowing.
 struct Flow {
+    /// The window this end grants each stream the peer sends on.
+    window: u32,
+    /// Set, under the `progress` lock, by the peer's first `Hello`.
     peer_windowed: AtomicBool,
+    /// The window the peer grants each stream this end sends on.
+    peer_window: AtomicU32,
     closed: AtomicBool,
     progress: Mutex<HashMap<u32, Arc<Progress>>>,
+    /// Credit owed for data whose pump is gone, by stream. The writer grants it,
+    /// so the reader never waits on a writer that waits on the peer.
+    owed: Mutex<HashMap<u32, u32>>,
+    owed_ready: Notify,
 }
 
 /// How much of one stream its pump has read and framed, and how much the peer
@@ -167,9 +179,77 @@ struct Progress {
 }
 
 impl Flow {
+    fn new(window: u32) -> Flow {
+        Flow {
+            window,
+            peer_windowed: AtomicBool::new(false),
+            peer_window: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+            progress: Mutex::new(HashMap::new()),
+            owed: Mutex::new(HashMap::new()),
+            owed_ready: Notify::new(),
+        }
+    }
+
+    /// How many bytes one stream may queue before the reader waits for its pump.
+    /// A windowed sender overshoots its window by at most one frame, so only a
+    /// peer without windowing, or one that sent before this end's `Hello` reached
+    /// it, makes the reader wait. A stream frame larger than this ends the
+    /// session, and `Hello` advertises it, so a sender may raise its frame size
+    /// up to this without breaking an older receiver.
+    fn queue_limit(&self) -> usize {
+        self.window as usize + MUX_HEADER + PUMP_BUF
+    }
+
+    /// The `Hello` payload: the version, the window this end grants, and the
+    /// largest stream frame it takes.
+    fn hello(&self) -> Vec<u8> {
+        let mut hello = WINDOW_VERSION.to_le_bytes().to_vec();
+        hello.extend_from_slice(&self.window.to_le_bytes());
+        hello.extend_from_slice(&(self.queue_limit() as u32).to_le_bytes());
+        hello
+    }
+
+    /// Takes the peer's `Hello`, and returns false when it advertises a window
+    /// of nothing or a stream frame smaller than [`MIN_STREAM_FRAME`]. A later
+    /// version may add fields after the ones read here. Only the first `Hello`
+    /// counts, so a second cannot grant every stream another window.
+    fn take_hello(&self, payload: &[u8]) -> bool {
+        // Only the reader calls this, so nothing else sets `peer_windowed` in
+        // between.
+        if self.peer_windowed.load(Ordering::Acquire) {
+            return true;
+        }
+        let field = |at: usize| payload.get(at..at + 4).and_then(decode_u32);
+        if field(0).is_none_or(|version| version < WINDOW_VERSION) {
+            return true;
+        }
+        let window = field(4).unwrap_or(STREAM_WINDOW);
+        let max_stream_frame = field(8).map_or(MIN_STREAM_FRAME, |max| max as usize);
+        if window == 0 || max_stream_frame < MIN_STREAM_FRAME {
+            return false;
+        }
+        let progress = self.progress.lock().unwrap();
+        self.peer_window.store(window, Ordering::Release);
+        // A stream opened before `Hello` has been charged for what it sent, so
+        // the window is added to what is left.
+        for stream in progress.values() {
+            *stream.available.lock().unwrap() += i64::from(window);
+            stream.granted.notify_waiters();
+        }
+        self.peer_windowed.store(true, Ordering::Release);
+        true
+    }
+
     fn open(self: &Arc<Self>, id: u32, socket: Option<Arc<AsyncFd<OwnedFd>>>) -> Outbound {
+        let mut streams = self.progress.lock().unwrap();
+        let window = if self.peer_windowed.load(Ordering::Acquire) {
+            self.peer_window.load(Ordering::Acquire)
+        } else {
+            0
+        };
         let progress = Arc::new(Progress {
-            available: Mutex::new(STREAM_WINDOW as i64),
+            available: Mutex::new(i64::from(window)),
             granted: Notify::new(),
             socket,
             taken: Mutex::new(0),
@@ -177,7 +257,8 @@ impl Flow {
             progressed: Notify::new(),
             done: AtomicBool::new(false),
         });
-        self.progress.lock().unwrap().insert(id, progress.clone());
+        streams.insert(id, progress.clone());
+        drop(streams);
         Outbound {
             flow: self.clone(),
             id,
@@ -188,9 +269,23 @@ impl Flow {
     fn grant(&self, id: u32, bytes: u32) {
         let progress = self.progress.lock().unwrap().get(&id).cloned();
         if let Some(progress) = progress {
-            *progress.available.lock().unwrap() += i64::from(bytes);
+            let mut available = progress.available.lock().unwrap();
+            *available = available.saturating_add(i64::from(bytes));
+            drop(available);
             progress.granted.notify_waiters();
         }
+    }
+
+    /// Records credit for data whose pump is gone, for the writer to grant.
+    fn owe(&self, id: u32, bytes: u32) {
+        let mut owed = self.owed.lock().unwrap();
+        if owed.len() >= MAX_OWED_STREAMS && !owed.contains_key(&id) {
+            return;
+        }
+        let entry = owed.entry(id).or_insert(0);
+        *entry = entry.saturating_add(bytes);
+        drop(owed);
+        self.owed_ready.notify_one();
     }
 
     /// Releases every sender waiting for credit, because no grant will come.
@@ -355,7 +450,7 @@ impl StreamSink {
             return None;
         }
         self.ungranted += cost;
-        if self.ungranted < GRANT_BATCH && !idle {
+        if self.ungranted < self.flow.window as usize / 4 && !idle {
             return None;
         }
         let grant = OutFrame::Window(self.id, self.ungranted as u32);
@@ -364,11 +459,15 @@ impl StreamSink {
     }
 
     /// Unregisters a stream whose pump stops before the peer closes it, and
-    /// returns a grant of a whole window. The sender may have spent its window on
-    /// data the pump will never write, and the reader grants only what arrives
+    /// returns a grant of the credit it still holds: what the pump wrote and has
+    /// not granted, and what is still queued. The reader grants only what arrives
     /// after the stream is gone.
-    fn abandon(self) -> Option<OutFrame> {
-        let grant = OutFrame::Window(self.id, STREAM_WINDOW as u32);
+    fn abandon(self, inbound: mpsc::UnboundedReceiver<StreamMsg>) -> Option<OutFrame> {
+        // Once the queue is closed nothing more is counted into it, so what it
+        // holds now is all it will ever hold.
+        drop(inbound);
+        let held = self.ungranted + self.depth.queued.load(Ordering::Acquire);
+        let grant = OutFrame::Window(self.id, u32::try_from(held).unwrap_or(u32::MAX));
         let windowed = self.flow.peer_windowed.load(Ordering::Acquire);
         drop(self);
         windowed.then_some(grant)
@@ -444,18 +543,27 @@ impl MuxTransport {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
+        let window = NonZeroU32::new(STREAM_WINDOW).expect("the default window is not zero");
+        MuxTransport::with_window(channel, side, window)
+    }
+
+    /// Builds a transport like [`MuxTransport::new`] that grants each stream the
+    /// peer sends on `window` bytes, counted as frame header plus payload. A
+    /// smaller window holds less for a reader that falls behind, and a larger one
+    /// lets a stream move more before it waits for a grant. A window above
+    /// `u32::MAX` less one frame is reduced to that.
+    pub fn with_window<S>(channel: S, side: Side, window: NonZeroU32) -> MuxTransport
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (reader, writer) = tokio::io::split(channel);
         let (frame_tx, frame_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(CHANNEL_DEPTH);
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
-        let flow = Arc::new(Flow::default());
+        let flow = Arc::new(Flow::new(window.get().min(MAX_WINDOW)));
         let (cancel_read, cancel_write) = pipe().expect("failed to create mux cancel pipe");
 
-        // The peer reads `Hello` before any stream data, so it knows to grant.
-        frame_tx
-            .try_send(OutFrame::Hello)
-            .expect("a new frame queue has room");
-        tokio::spawn(writer_task(writer, frame_rx));
+        tokio::spawn(writer_task(writer, frame_rx, flow.clone()));
         let reader = tokio::spawn(reader_task(
             reader,
             ctrl_tx,
@@ -583,15 +691,38 @@ impl ControlSender for MuxControlSender {
 }
 
 /// Serializes all outbound frames onto the channel in queue order.
-async fn writer_task<W>(mut writer: W, mut frame_rx: mpsc::Receiver<OutFrame>)
+async fn writer_task<W>(mut writer: W, mut frame_rx: mpsc::Receiver<OutFrame>, flow: Arc<Flow>)
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(frame) = frame_rx.recv().await {
-        let result = match frame {
-            OutFrame::Hello => {
-                write_frame(&mut writer, KIND_HELLO, 0, &WINDOW_VERSION.to_le_bytes()).await
+    // The peer reads `Hello` before anything else, so it knows to grant.
+    if write_frame(&mut writer, KIND_HELLO, 0, &flow.hello())
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = flow.owed_ready.notified() => {
+                let owed = std::mem::take(&mut *flow.owed.lock().unwrap());
+                for (id, bytes) in owed {
+                    if write_frame(&mut writer, KIND_WINDOW, id, &bytes.to_le_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                continue;
             }
+            frame = frame_rx.recv() => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
+        };
+        let result = match frame {
             OutFrame::Control(buf) => write_frame(&mut writer, KIND_CONTROL, 0, &buf).await,
             OutFrame::Fds(buf) => write_frame(&mut writer, KIND_FDS, 0, &buf).await,
             OutFrame::StreamData(id, buf) => {
@@ -662,13 +793,13 @@ async fn reader_task<R>(
             }
             KIND_STREAM_DATA => {
                 let cost = MUX_HEADER + payload.len();
-                if cost > STREAM_QUEUE_LIMIT {
+                if cost > flow.queue_limit() {
                     break;
                 }
                 let inbound = streams.lock().unwrap().get(&id).cloned();
                 let delivered = match inbound {
                     Some(inbound) => {
-                        wait_for_room(&inbound, cost).await;
+                        wait_for_room(&inbound, cost, flow.queue_limit()).await;
                         inbound.depth.queued.fetch_add(cost, Ordering::AcqRel);
                         inbound.tx.send(StreamMsg::Data(payload)).is_ok()
                     }
@@ -676,7 +807,7 @@ async fn reader_task<R>(
                 };
                 // The sender still waits for credit for data whose pump is gone.
                 if !delivered && flow.peer_windowed.load(Ordering::Acquire) {
-                    let _ = frame_tx.send(OutFrame::Window(id, cost as u32)).await;
+                    flow.owe(id, cost as u32);
                 }
             }
             KIND_STREAM_CLOSE => {
@@ -685,14 +816,7 @@ async fn reader_task<R>(
                     let _ = inbound.tx.send(StreamMsg::Close);
                 }
             }
-            KIND_HELLO => {
-                // A later version may add fields after the version, so only
-                // the first four bytes are read.
-                let version = payload.get(..4).and_then(decode_u32);
-                if version.is_some_and(|version| version >= WINDOW_VERSION) {
-                    flow.peer_windowed.store(true, Ordering::Release);
-                }
-            }
+            KIND_HELLO if !flow.take_hello(&payload) => break,
             KIND_WINDOW => {
                 if let Some(bytes) = decode_u32(&payload) {
                     flow.grant(id, bytes);
@@ -705,18 +829,16 @@ async fn reader_task<R>(
     flow.close();
 }
 
-/// Waits until a stream's queue has room for `cost` more bytes, or its pump is
-/// gone. An empty queue always has room, so one large frame cannot wait forever.
-async fn wait_for_room(inbound: &Inbound, cost: usize) {
+/// Waits until a stream's queue has room for `cost` more bytes within `limit`,
+/// or its pump is gone. An empty queue always has room, so one large frame
+/// cannot wait forever.
+async fn wait_for_room(inbound: &Inbound, cost: usize, limit: usize) {
     loop {
         let drained = inbound.depth.drained.notified();
         tokio::pin!(drained);
         drained.as_mut().enable();
         let queued = inbound.depth.queued.load(Ordering::Acquire);
-        if queued == 0
-            || queued + cost <= STREAM_QUEUE_LIMIT
-            || inbound.depth.closed.load(Ordering::Acquire)
-        {
+        if queued == 0 || queued + cost <= limit || inbound.depth.closed.load(Ordering::Acquire) {
             return;
         }
         drained.await;
@@ -873,7 +995,7 @@ fn spawn_blocking_writer(
             match msg {
                 StreamMsg::Data(bytes) => {
                     if write_all_blocking(&fd, &bytes).is_err() {
-                        if let Some(grant) = sink.abandon() {
+                        if let Some(grant) = sink.abandon(inbound) {
                             let _ = frame_tx.blocking_send(grant);
                         }
                         return;
@@ -1029,7 +1151,7 @@ async fn async_writer(
             }
         }
     }
-    if let Some(grant) = sink.abandon() {
+    if let Some(grant) = sink.abandon(inbound) {
         let _ = frame_tx.send(grant).await;
     }
 }
