@@ -99,7 +99,11 @@ messages (window-size updates) concurrently with a parked `recv()`.
   Each stream has a credit window that the receiver returns with `Window`
   frames, so a stream nobody reads cannot stall the reader. Only a peer that
   sent `Hello` is held to grants, so old peers still interoperate, and each
-  stream's queue is limited in bytes for them. `send` is a barrier: it waits
+  stream's queue is limited in bytes for them. `Hello` advertises the window
+  each end grants (`MuxTransport::with_window`) and the largest stream frame it
+  takes, and a sender honors the peer's values. Each end sets its own queue
+  limit and grants from its own window, never from the peer's, and only the
+  first `Hello` counts. `send` is a barrier: it waits
   until every socket-backed stream has framed what was unread when it began.
   Without it, an `Exit` overtakes output still in the socket or waiting for
   credit, and the caller loses the tail of it (this was a real bug).

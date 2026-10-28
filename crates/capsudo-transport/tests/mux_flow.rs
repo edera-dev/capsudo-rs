@@ -3,6 +3,7 @@
 //! not stall or exhaust the other end.
 
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -53,6 +54,32 @@ fn flood(mut feed: UnixStream, bytes: usize) {
             sent += chunk.len();
         }
     });
+}
+
+/// A `Hello` that advertises `window` and `max_stream_frame`.
+fn hello(window: u32, max_stream_frame: u32) -> Vec<u8> {
+    let mut payload = 1u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&window.to_le_bytes());
+    payload.extend_from_slice(&max_stream_frame.to_le_bytes());
+    frame(KIND_HELLO, 0, &payload)
+}
+
+/// Reads frames until the listener goes quiet, and returns how much stream data
+/// arrived and the largest stream frame, as header plus payload.
+async fn ungranted_output(raw: &mut DuplexStream) -> (usize, usize) {
+    let (mut received, mut largest) = (0, 0);
+    let mut header = [0u8; 9];
+    while let Ok(read) = timeout(Duration::from_millis(500), raw.read_exact(&mut header)).await {
+        read.unwrap();
+        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        raw.read_exact(&mut payload).await.unwrap();
+        if header[0] == KIND_STREAM_DATA {
+            received += len;
+            largest = largest.max(header.len() + len);
+        }
+    }
+    (received, largest)
 }
 
 /// Writes `frames` to a listener from a raw peer, and returns the listener.
@@ -311,35 +338,26 @@ async fn a_stream_that_reuses_an_id_keeps_its_credit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hello_with_fields_after_the_version_still_turns_on_windowing() {
+async fn a_hello_with_fields_this_version_does_not_know_still_turns_on_windowing() {
     // Far less than this arrives from a windowed stream that is never granted.
     const UNGRANTED_LIMIT: usize = 2 * 1024 * 1024;
 
-    let mut hello = 1u32.to_le_bytes().to_vec();
+    let mut hello = hello(1024 * 1024, 1024 * 1024);
     hello.extend_from_slice(&[0xff; 12]);
-    let (mut listener, mut raw) =
-        listener_fed(&[frame(KIND_HELLO, 0, &hello), fds_frame(1, 1, 1)]).await;
+    let length = (hello.len() - 9) as u32;
+    hello[5..9].copy_from_slice(&length.to_le_bytes());
+    let (mut listener, mut raw) = listener_fed(&[hello, fds_frame(1, 1, 1)]).await;
     let output = listener.recv().await.unwrap().unwrap().fds;
     flood(
         UnixStream::from(output.into_iter().next().unwrap()),
         8 * 1024 * 1024,
     );
 
-    let mut received = 0;
-    let mut header = [0u8; 9];
-    while let Ok(read) = timeout(Duration::from_millis(500), raw.read_exact(&mut header)).await {
-        read.unwrap();
-        let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; len];
-        raw.read_exact(&mut payload).await.unwrap();
-        if header[0] == KIND_STREAM_DATA {
-            received += len;
-        }
-        assert!(
-            received < UNGRANTED_LIMIT,
-            "the listener sent {received} bytes without a grant"
-        );
-    }
+    let (received, _) = ungranted_output(&mut raw).await;
+    assert!(
+        received < UNGRANTED_LIMIT,
+        "the listener sent {received} bytes without a grant"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -508,4 +526,143 @@ async fn an_fds_frame_past_the_stream_limit_ends_the_session() {
         .await
         .expect("the listener waited after a frame past its stream limit");
     assert!(after.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_stops_at_the_window_its_peer_advertises() {
+    const WINDOW: usize = 64 * 1024;
+
+    let (mut listener, mut raw) =
+        listener_fed(&[hello(WINDOW as u32, 1024 * 1024), fds_frame(1, 1, 1)]).await;
+    let output = listener.recv().await.unwrap().unwrap().fds;
+    flood(
+        UnixStream::from(output.into_iter().next().unwrap()),
+        8 * 1024 * 1024,
+    );
+
+    // The sender stops once its credit is spent, which is at most one frame
+    // past the window.
+    let (received, _) = ungranted_output(&mut raw).await;
+    assert!(received > 0);
+    assert!(
+        received <= WINDOW + 16 * 1024,
+        "the listener sent {received} bytes on a window of {WINDOW}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_hello_grants_nothing() {
+    const WINDOW: u32 = 64 * 1024;
+
+    let (mut listener, mut raw) =
+        listener_fed(&[hello(WINDOW, 1024 * 1024), fds_frame(1, 1, 1)]).await;
+    let output = listener.recv().await.unwrap().unwrap().fds;
+    flood(
+        UnixStream::from(output.into_iter().next().unwrap()),
+        8 * 1024 * 1024,
+    );
+    let (spent, _) = ungranted_output(&mut raw).await;
+    assert!(spent > 0);
+
+    // The stream has spent its window, so only a grant could let it send more.
+    raw.write_all(&hello(WINDOW, 1024 * 1024)).await.unwrap();
+    let (received, _) = ungranted_output(&mut raw).await;
+    assert_eq!(
+        received, 0,
+        "a second hello let the listener send {received} more bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_opened_before_hello_gets_its_window() {
+    // The stream sends freely until `Hello` arrives, so its window must cover
+    // what it already sent as well as what follows.
+    const PAYLOAD: usize = 4 * 1024 * 1024;
+
+    let (mut listener, mut raw) = listener_fed(&[fds_frame(1, 1, 1)]).await;
+    let output = listener.recv().await.unwrap().unwrap().fds;
+    flood(
+        UnixStream::from(output.into_iter().next().unwrap()),
+        PAYLOAD,
+    );
+
+    timeout(Duration::from_secs(10), async {
+        let mut received = 0;
+        let mut said_hello = false;
+        while received < PAYLOAD {
+            let mut header = [0u8; 9];
+            raw.read_exact(&mut header).await.unwrap();
+            let len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; len];
+            raw.read_exact(&mut payload).await.unwrap();
+            if header[0] != KIND_STREAM_DATA {
+                continue;
+            }
+            received += len;
+            if !said_hello {
+                raw.write_all(&hello(1024 * 1024, 1024 * 1024))
+                    .await
+                    .unwrap();
+                said_hello = true;
+            }
+            let grant = ((header.len() + len) as u32).to_le_bytes();
+            raw.write_all(&frame(KIND_WINDOW, 1, &grant)).await.unwrap();
+        }
+    })
+    .await
+    .expect("a stream opened before hello stopped for good");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_keeps_its_frames_within_what_its_peer_takes() {
+    const MAX_STREAM_FRAME: usize = 1024;
+
+    let (mut listener, mut raw) = listener_fed(&[
+        hello(1024 * 1024, MAX_STREAM_FRAME as u32),
+        fds_frame(1, 1, 1),
+    ])
+    .await;
+    let output = listener.recv().await.unwrap().unwrap().fds;
+    flood(
+        UnixStream::from(output.into_iter().next().unwrap()),
+        8 * 1024 * 1024,
+    );
+
+    let (received, largest) = ungranted_output(&mut raw).await;
+    assert!(received > 0);
+    assert!(
+        largest <= MAX_STREAM_FRAME,
+        "the listener sent a {largest}-byte frame to a peer that takes {MAX_STREAM_FRAME}"
+    );
+}
+
+#[tokio::test]
+async fn a_hello_whose_frames_cannot_carry_data_ends_the_session() {
+    let (mut listener, _raw) = listener_fed(&[hello(1024 * 1024, 9)]).await;
+    let after = timeout(Duration::from_secs(5), listener.recv())
+        .await
+        .expect("the listener waited after a hello no stream could use");
+    assert!(after.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_transport_advertises_the_window_it_was_built_with() {
+    const WINDOW: u32 = 64 * 1024;
+
+    let (mut raw, listener_io) = tokio::io::duplex(64 * 1024);
+    let _listener = MuxTransport::with_window(
+        listener_io,
+        Side::Listener,
+        NonZeroU32::new(WINDOW).unwrap(),
+    );
+    let mut header = [0u8; 9];
+    raw.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0], KIND_HELLO);
+    let mut payload = vec![0u8; u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize];
+    raw.read_exact(&mut payload).await.unwrap();
+    let field = |at: usize| u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+    assert_eq!(field(0), 1);
+    assert_eq!(field(4), WINDOW);
+    // One window plus the one frame a windowed sender may overshoot it by.
+    assert_eq!(field(8), WINDOW + 9 + 16 * 1024);
 }
