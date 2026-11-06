@@ -9,6 +9,7 @@ mod client;
 mod daemon;
 mod error;
 mod exit;
+mod lsm;
 mod pty;
 
 pub use client::{read_winsize, run_client, run_session, ClientRequest, SessionOutcome};

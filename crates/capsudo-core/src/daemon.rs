@@ -14,6 +14,7 @@ use tokio::process::Command;
 
 use crate::error::{CoreError, Result};
 use crate::exit::{exit_code, send_error, send_exit, send_spawn_failure};
+use crate::lsm;
 use crate::pty;
 
 /// Default terminal size assumed if the client sends no window size.
@@ -41,7 +42,11 @@ struct SessionRequest {
     session_type: SessionType,
     stdio: [OwnedFd; 3],
     winsize: [u16; 4],
-    /// SELinux context of the connecting peer, to run the child under.
+    /// SELinux context of the connecting peer, to run the child under. `None`
+    /// unless SELinux is the LSM that answers both `SO_PEERSEC` and
+    /// `/proc/self/attr/exec`. On AppArmor, Smack or no LSM, the peer's label
+    /// (if any) is not an exec context, and the child runs under the daemon's
+    /// own. See [`crate::lsm`].
     secontext: Option<Vec<u8>>,
 }
 
@@ -63,6 +68,11 @@ pub(crate) fn build_command(argv: &[String], envp: &[String]) -> Command {
 
 /// Applies an SELinux exec context in the just-forked child via
 /// `/proc/self/attr/exec`. Uses only async-signal-safe syscalls.
+///
+/// Only call this with a context captured while [`lsm::applies_peer_context`]
+/// held: the write goes to whichever LSM is first in the kernel's order, and
+/// anything but SELinux rejects the label with `EINVAL`. A failure here fails
+/// the spawn, so on SELinux the child never runs under the wrong context.
 pub(crate) fn write_secontext_in_child(context: &[u8]) -> std::io::Result<()> {
     let fd = unsafe { libc::open(c"/proc/self/attr/exec".as_ptr(), libc::O_WRONLY) };
     if fd < 0 {
@@ -92,8 +102,14 @@ pub async fn serve_connection(transport: &mut dyn Transport, config: &DaemonConf
     };
 
     // The peer's SELinux context (where the transport can supply it) is applied
-    // to the child so it runs as the caller, not the daemon.
-    request.secontext = transport.peer_secontext();
+    // to the child so it runs as the caller, not the daemon. Only SELinux takes
+    // that label back as an exec context. Elsewhere, applying it would fail
+    // every spawn, so it is not captured at all.
+    request.secontext = if lsm::applies_peer_context() {
+        transport.peer_secontext()
+    } else {
+        None
+    };
 
     run_and_report(transport, request).await
 }
