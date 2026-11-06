@@ -17,7 +17,7 @@ cargo build --features capsudo-transport/fakeidm   # build the fake IDM stub
   enables the feature), so a plain `cargo test` already covers the cross-zone
   path — no `--features` needed.
 - Linux-only: relies on `SCM_RIGHTS`, `SO_PEERCRED`/`SO_PEERSEC`, ptys, and
-  `/proc/self/attr/exec`.
+  `/proc/self/attr/exec` (the last only on SELinux hosts).
 
 ## What this is
 
@@ -55,7 +55,8 @@ transport decides how to realize it.** Client and daemon are written against the
 trait alone and never change between local and cross-zone.
 
 - `unix::UnixTransport` — real `SCM_RIGHTS`. Also supplies `peer_cred`
-  (`SO_PEERCRED`, used by pwauth) and `peer_secontext` (`SO_PEERSEC`, used for
+  (`SO_PEERCRED`, used by pwauth) and `peer_secontext` (`SO_PEERSEC`, the label
+  from whichever LSM the kernel asks first; the daemon uses it only for
   SELinux propagation).
 - `mux::MuxTransport` — wraps **any** `AsyncRead + AsyncWrite` byte channel and
   *simulates* descriptor passing. When you "send an fd", it opens a logical
@@ -83,8 +84,9 @@ messages (window-size updates) concurrently with a parked `recv()`.
   `run_session` surfaces an `Unauthorized` challenge so the binary can prompt and
   retry; `run_client` is the simple wrapper.
 - `daemon` — `serve_connection` drains the handshake (applying the `-f`/`-E`
-  attenuation), captures the peer SELinux context, then runs the program with the
-  delegated stdio and relays the exit status.
+  attenuation), captures the peer SELinux context (only when SELinux is the
+  LSM in charge; see `lsm`), then runs the program with the delegated stdio and
+  relays the exit status.
 - `pty` — interactive sessions allocate the pty **on the daemon side** (see
   README for why) and bridge the master to the client's delegated descriptors.
 
@@ -135,6 +137,17 @@ messages (window-size updates) concurrently with a parked `recv()`.
   `SessionOutcome::Failed`, because an embedder (Protect's daemon) needs to log
   and attribute it, not have it appear on the process's stderr. Printing it is
   the `capsudo` binary's job.
-- SELinux/`SO_PEERSEC` and a successful pwauth login can only be exercised on an
-  SELinux host / with root + a real password; the rest is covered by `cargo test`
-  and the binaries' smoke paths.
+- `SO_PEERSEC` and `/proc/self/attr/exec` don't name an LSM. The kernel
+  answers both from the first major LSM (SELinux, Smack, AppArmor) in its
+  order. Only SELinux takes the peer label back as an exec context. AppArmor
+  rejects it with `EINVAL`, which used to fail every spawn on Ubuntu. So
+  `lsm::applies_peer_context` probes once which LSM is in charge
+  (`lsm_list_modules(2)`, then `/sys/kernel/security/lsm`, then `selinuxfs` in
+  `/proc/filesystems`). The daemon captures the peer label only when that LSM
+  is SELinux. On other hosts the child runs under the daemon's own label. Keep
+  the probe out of `pre_exec`: it must stay async-signal-safe.
+- `tests/unix_session.rs` runs sessions over a real Unix socket, so CI on
+  `ubuntu-latest` (AppArmor) exercises the non-SELinux path. Applying a label
+  on SELinux, and a successful pwauth login, can only be exercised on an
+  SELinux host / with root + a real password. The rest is covered by
+  `cargo test` and the binaries' smoke paths.

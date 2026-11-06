@@ -135,7 +135,12 @@ pub trait Transport: Send {
         None
     }
 
-    /// Best-effort peer security context (e.g. an SELinux label), if available.
+    /// Best-effort peer security context, if available.
+    ///
+    /// For a Unix socket this is `SO_PEERSEC`, which reports the label of
+    /// whichever LSM the kernel asks first (SELinux, AppArmor or Smack). It is
+    /// not necessarily an SELinux context, so the caller must check which LSM
+    /// is active before interpreting it.
     fn peer_secontext(&self) -> Option<Vec<u8>> {
         None
     }
